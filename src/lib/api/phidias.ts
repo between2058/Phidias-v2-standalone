@@ -47,15 +47,14 @@ export interface BatchGenerationResponse {
 }
 
 // ============================================================================
-// Segment 3D Response Interface (matches Python SegmentationServiceResponse)
+// Segment 3D Response Interface (matches P3-SAM API SegmentResponse)
 // ============================================================================
 
 export interface Segment3DResponse {
-    status: string;
     request_id: string;
     num_parts: number;
-    segmented_glb_url: string;
-    message?: string;
+    /** Download path returned by P3-SAM, e.g. /download/{id}/segmented_output_parts.glb */
+    segmented_glb: string;
 }
 
 // ============================================================================
@@ -114,7 +113,7 @@ export async function segment3D(
     if (params.seed !== undefined) formData.append('seed', String(params.seed));
     if (params.prompt_bs !== undefined) formData.append('prompt_bs', String(params.prompt_bs));
 
-    const { data } = await client.post<Segment3DResponse>(`${getBackendApi()}/phidias/segment/3d`, formData, {
+    const { data } = await client.post<Segment3DResponse>(`/api/phidias/segment/3d`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 300000
     });
@@ -273,11 +272,19 @@ export async function generateReconSingle(
     if (params.slat_guidance_strength !== undefined) formData.append('slat_guidance_strength', String(params.slat_guidance_strength));
     if (params.slat_sampling_steps !== undefined) formData.append('slat_sampling_steps', String(params.slat_sampling_steps));
 
-    const { data } = await client.post<ReconViaGenOutput>(`${getBackendApi()}/phidias/reconviagen/generate-single`, formData, {
+    const { data } = await client.post<any>(`/api/phidias/reconviagen/generate-single`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 300000
     });
-    return data;
+    // Normalize: API returns glb_file/ply_file; extract request_id from path
+    const glbPath: string = data.glb_file ?? data.glb_url ?? '';
+    const requestId = glbPath.split('/')[2] ?? '';
+    return {
+        ...data,
+        request_id: requestId,
+        glb_url: glbPath,
+        ply_url: data.ply_file ?? data.ply_url ?? '',
+    } as ReconViaGenOutput;
 }
 
 export async function generateReconMulti(
@@ -304,11 +311,18 @@ export async function generateReconMulti(
     if (params.slat_sampling_steps !== undefined) formData.append('slat_sampling_steps', String(params.slat_sampling_steps));
     if (params.multiimage_algo !== undefined) formData.append('multiimage_algo', String(params.multiimage_algo));
 
-    const { data } = await client.post<ReconViaGenOutput>(`${getBackendApi()}/phidias/reconviagen/generate-multi`, formData, {
+    const { data } = await client.post<any>(`/api/phidias/reconviagen/generate-multi`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 300000
     });
-    return data;
+    const glbPath: string = data.glb_file ?? data.glb_url ?? '';
+    const requestId = glbPath.split('/')[2] ?? '';
+    return {
+        ...data,
+        request_id: requestId,
+        glb_url: glbPath,
+        ply_url: data.ply_file ?? data.ply_url ?? '',
+    } as ReconViaGenOutput;
 }
 
 export async function generateReconBatch(
@@ -333,11 +347,18 @@ export async function generateReconBatch(
     if (params.slat_guidance_strength !== undefined) formData.append('slat_guidance_strength', String(params.slat_guidance_strength));
     if (params.slat_sampling_steps !== undefined) formData.append('slat_sampling_steps', String(params.slat_sampling_steps));
 
-    const { data } = await client.post<BatchGenerationResponse>(`${getBackendApi()}/phidias/reconviagen/generate-batch`, formData, {
+    const { data } = await client.post<any>(`/api/phidias/reconviagen/generate-batch`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 600000
     });
-    return data;
+    // Normalize each result: add index, rename glb_file → glb_url
+    const results = (data.results ?? []).map((item: any, idx: number) => ({
+        ...item,
+        index: idx,
+        glb_url: item.glb_file ?? item.glb_url ?? undefined,
+        ply_url: item.ply_file ?? item.ply_url ?? undefined,
+    }));
+    return { ...data, results } as BatchGenerationResponse;
 }
 
 export interface QwenText2ImgResponse {
@@ -359,7 +380,7 @@ export interface QwenEditResponse {
  * Downloads an image from the server using the specific request_id and filename.
  */
 export async function downloadPhidiasImage(requestId: string, fileName: string, model: string): Promise<Blob> {
-    const { data } = await client.get<Blob>(`${getBackendApi()}/phidias/${model}/download/${requestId}/${fileName}`, {
+    const { data } = await client.get<Blob>(`/api/phidias/${model}/download/${requestId}/${fileName}`, {
         timeout: 60000
     });
     return data;
@@ -378,9 +399,19 @@ export function blobToDataURL(blob: Blob): Promise<string> {
 }
 
 export async function generateText2Img(prompt: string, params: any = {}): Promise<QwenText2ImgResponse> {
-    const { data } = await client.post<QwenText2ImgResponse>(`${getBackendApi()}/phidias/qwen/text2img`, {
-        prompt, ...params
-    }, { timeout: 300000 });
+    const formData = new FormData();
+    formData.append('prompt', prompt);
+    if (params.negative_prompt !== undefined) formData.append('negative_prompt', String(params.negative_prompt));
+    if (params.aspect_ratio !== undefined) formData.append('aspect_ratio', String(params.aspect_ratio));
+    if (params.num_steps !== undefined) formData.append('num_steps', String(params.num_steps));
+    if (params.cfg_scale !== undefined) formData.append('cfg_scale', String(params.cfg_scale));
+    if (params.seed !== undefined) formData.append('seed', String(params.seed));
+    if (params.num_samples !== undefined) formData.append('num_samples', String(params.num_samples));
+
+    const { data } = await client.post<QwenText2ImgResponse>(`/api/phidias/qwen/text2img`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+        timeout: 300000,
+    });
 
     const requestId = data.request_id;
     const downloadedUrls = await Promise.all(
@@ -403,14 +434,16 @@ export async function editImage(imageBlob: File | Blob, prompt: string, params: 
     if (params.seed !== undefined) formData.append('seed', String(params.seed));
     if (params.num_samples !== undefined) formData.append('num_samples', String(params.num_samples));
 
-    const { data } = await client.post<QwenEditResponse>(`${getBackendApi()}/phidias/qwen/edit`, formData, {
+    const { data } = await client.post<QwenEditResponse>(`/api/phidias/qwen/edit`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 300000
     });
 
     const requestId = data.request_id;
+    // Qwen API returns result_urls; normalize to urls for consistency
+    const rawUrls: string[] = (data as any).result_urls ?? data.urls ?? [];
     const downloadedUrls = await Promise.all(
-        (data.urls || []).map(async (url) => {
+        rawUrls.map(async (url) => {
             const fileName = url.split('/').pop() || '';
             const blob = await downloadPhidiasImage(requestId, fileName, 'qwen');
             return await blobToDataURL(blob);
@@ -428,15 +461,16 @@ export async function generateAngleCustom(imageBlob: Blob, params: any = {}): Pr
     formData.append('elevation', String(params.elevation ?? 0));
     formData.append('distance', String(params.distance ?? 1.0));
 
-    const { data } = await client.post<QwenAngleCustomResponse>(`${getBackendApi()}/phidias/qwen/angle/custom`, formData, {
+    const { data } = await client.post<QwenAngleCustomResponse>(`/api/phidias/qwen/angle/custom`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 300000
     });
 
-    // Fallback logic for request_id if not present in custom response
-    const urlParts = data.url.split('/');
-    const fileName = urlParts.pop() || '';
-    const requestId = data.request_id || urlParts.pop() || '';
+    // Qwen /angle returns { request_id, results: { custom: '/download/…' } }
+    const rawResult = data as any;
+    const rawUrl: string = rawResult.results?.custom ?? rawResult.url ?? '';
+    const requestId: string = rawResult.request_id ?? '';
+    const fileName = rawUrl.split('/').pop() || '';
 
     return await downloadPhidiasImage(requestId, fileName, 'qwen');
 }
@@ -449,7 +483,7 @@ export async function generateAngleMulti(imageBlob: Blob, params: any = {}): Pro
     formData.append('elevation', String(params.elevation ?? 0));
     formData.append('distance', String(params.distance ?? 1.0));
 
-    const { data } = await client.post<QwenAngleMultiResponse>(`${getBackendApi()}/phidias/qwen/angle/multi`, formData, {
+    const { data } = await client.post<QwenAngleMultiResponse>(`/api/phidias/qwen/angle/multi`, formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
         timeout: 300000
     });

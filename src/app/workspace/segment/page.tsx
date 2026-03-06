@@ -12,8 +12,10 @@ import type { TransformValues } from '@/components/shared/TransformPanel';
 import type { HierarchyItem } from '@/components/shared/HierarchyPanel';
 import { findObjectInScene, transformDataToValues } from '@/lib/scene';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useSegmentStore } from '@/store/segment-store';
+import { segment3D, downloadPhidiasImage } from '@/lib/api/phidias';
 
 const ThreeViewport = dynamic(() => import('@/components/shared/ThreeViewport'), {
     ssr: false,
@@ -48,13 +50,6 @@ const SEGMENT_PALETTE = [
     '#f97316', '#a855f7', '#14b8a6', '#eab308',
 ];
 
-// Realistic P3-SAM part names for the mock result
-const MOCK_PART_NAMES = [
-    'Body Shell', 'Front Bumper', 'Rear Bumper', 'Hood',
-    'Door (L)', 'Door (R)', 'Roof Panel', 'Trunk Lid',
-    'Wheel (FL)', 'Wheel (FR)', 'Wheel (RL)', 'Wheel (RR)',
-    'Windshield', 'Side Mirror (L)', 'Side Mirror (R)', 'Exhaust',
-];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -97,51 +92,97 @@ function partsToHierarchyItems(parts: Part[]): HierarchyItem[] {
     });
 }
 
-// ─── Mock P3-SAM segmentation ─────────────────────────────────────────────────
-// Simulates the backend POST /segment/3d call.
-// In production this would POST the current GLB and receive a segmented GLB + part labels.
-
-function simulateP3SAMSegmentation(
-    params: P3SAMParams,
-    availableMeshIds: string[],
-    onProgress: (pct: number) => void,
-    signal: AbortSignal
-): Promise<SegmentResult[]> {
+// ─── splitSegmentedGlb ────────────────────────────────────────────────────────
+// P3-SAM returns a single mesh with COLOR_0 vertex attributes (one color per
+// segment).  This helper splits it into one Three.js Mesh per colour group so
+// that the scene graph contains selectable individual parts.
+// The per-group material colour comes from P3-SAM's vertex colours — no
+// SEGMENT_PALETTE is applied here.
+async function splitSegmentedGlb(blob: Blob): Promise<Blob> {
     return new Promise((resolve, reject) => {
-        // Estimate runtime based on point density (just for the mock)
-        const totalMs = 2000 + (params.point_num / 100000) * 1500;
-        const tickMs = 150;
-        let elapsed = 0;
+        const url = URL.createObjectURL(blob);
+        const loader = new GLTFLoader();
+        loader.load(url, (gltf) => {
+            URL.revokeObjectURL(url);
+            const scene = gltf.scene;
+            const toProcess: THREE.Mesh[] = [];
+            scene.traverse((child) => {
+                if (child instanceof THREE.Mesh) toProcess.push(child);
+            });
 
-        const tick = () => {
-            if (signal.aborted) {
-                reject(new DOMException('Aborted', 'AbortError'));
-                return;
+            for (const child of toProcess) {
+                const geo = child.geometry as THREE.BufferGeometry;
+                const colorAttr = geo.getAttribute('color') as THREE.BufferAttribute | undefined;
+                if (!colorAttr) continue;
+
+                const posAttr = geo.getAttribute('position') as THREE.BufferAttribute;
+                const normAttr = geo.getAttribute('normal') as THREE.BufferAttribute | undefined;
+                const uvAttr = geo.getAttribute('uv') as THREE.BufferAttribute | undefined;
+                const indexAttr = geo.index;
+
+                // Group face starts by the first vertex's RGB colour (0-255 key)
+                const colorGroups = new Map<string, number[]>();
+                const faceCount = indexAttr ? indexAttr.count / 3 : posAttr.count / 3;
+                for (let f = 0; f < faceCount; f++) {
+                    const vi = indexAttr ? indexAttr.getX(f * 3) : f * 3;
+                    const r = Math.round(colorAttr.getX(vi) * 255);
+                    const g = Math.round(colorAttr.getY(vi) * 255);
+                    const b = Math.round(colorAttr.getZ(vi) * 255);
+                    const key = `${r},${g},${b}`;
+                    if (!colorGroups.has(key)) colorGroups.set(key, []);
+                    colorGroups.get(key)!.push(f);
+                }
+
+                if (colorGroups.size <= 1) continue; // nothing to split
+
+                const parent = child.parent ?? scene;
+                let partIndex = 0;
+
+                for (const [colorKey, faces] of Array.from(colorGroups.entries())) {
+                    const positions: number[] = [];
+                    const normals: number[] = [];
+                    const uvs: number[] = [];
+
+                    for (const f of faces) {
+                        for (let j = 0; j < 3; j++) {
+                            const vi = indexAttr ? indexAttr.getX(f * 3 + j) : f * 3 + j;
+                            positions.push(posAttr.getX(vi), posAttr.getY(vi), posAttr.getZ(vi));
+                            if (normAttr) normals.push(normAttr.getX(vi), normAttr.getY(vi), normAttr.getZ(vi));
+                            if (uvAttr) uvs.push(uvAttr.getX(vi), uvAttr.getY(vi));
+                        }
+                    }
+
+                    const newGeo = new THREE.BufferGeometry();
+                    newGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                    if (normals.length) newGeo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+                    if (uvs.length) newGeo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+
+                    const [r, g, b] = colorKey.split(',').map(Number);
+                    const mat = new THREE.MeshStandardMaterial({
+                        color: new THREE.Color(r / 255, g / 255, b / 255),
+                    });
+
+                    const mesh = new THREE.Mesh(newGeo, mat);
+                    mesh.name = `part_${partIndex}`;
+                    mesh.applyMatrix4(child.matrixWorld);
+                    parent.add(mesh);
+                    partIndex++;
+                }
+
+                parent.remove(child);
             }
-            elapsed += tickMs;
-            onProgress(Math.min((elapsed / totalMs) * 100, 97));
-            if (elapsed < totalMs) {
-                setTimeout(tick, tickMs);
-            } else {
-                // Generate mock results: 4–8 parts depending on threshold
-                const partCount = Math.max(4, Math.min(8, Math.round(8 * (1 - params.threshold) + 4)));
-                // Distribute available meshes across parts
-                const chunkSize = Math.ceil(availableMeshIds.length / partCount);
 
-                const results: SegmentResult[] = Array.from({ length: partCount }, (_, i) => ({
-                    id: `ai-part-${i}`,
-                    name: MOCK_PART_NAMES[i] ?? `Part ${i + 1}`,
-                    color: SEGMENT_PALETTE[i % SEGMENT_PALETTE.length],
-                    // Mock IoU score — slightly randomized for realism
-                    score: parseFloat((0.75 + Math.random() * 0.22).toFixed(3)),
-                    meshIds: availableMeshIds.slice(i * chunkSize, (i + 1) * chunkSize),
-                }));
-
-                onProgress(100);
-                setTimeout(() => resolve(results), 200);
-            }
-        };
-        setTimeout(tick, tickMs);
+            const exporter = new GLTFExporter();
+            exporter.parse(
+                scene,
+                (result) => resolve(new Blob([result as ArrayBuffer], { type: 'model/gltf-binary' })),
+                (err) => reject(err),
+                { binary: true },
+            );
+        }, undefined, (err) => {
+            URL.revokeObjectURL(url);
+            reject(err);
+        });
     });
 }
 
@@ -325,16 +366,14 @@ export default function SegmentPage() {
 
     const handleSceneGraphChange = useCallback((nodes: HierarchyItem[]) => {
         const meshes = flattenMeshes(nodes);
-        const newParts: Part[] = meshes.map((m, i) => ({
+        // color: '' → segmentColors won't override the mesh's original material
+        const newParts: Part[] = meshes.map((m) => ({
             id: m.id,
             name: m.name,
-            color: SEGMENT_PALETTE[i % SEGMENT_PALETTE.length],
+            color: '',
             visible: m.visible,
             meshIds: [m.id],
         }));
-        // Model load must NOT enter zundo history — pause recording, apply
-        // the new parts, resume, then clear so the user can never undo back
-        // to a state before the current model was loaded.
         const temporal = useSegmentStore.temporal.getState();
         temporal.pause();
         setParts(newParts);
@@ -658,33 +697,71 @@ export default function SegmentPage() {
         const controller = new AbortController();
         abortRef.current = controller;
 
-        // Gather all mesh IDs from the current scene
-        const allMeshIds = parts.flatMap(p => p.meshIds);
-
         try {
-            const results = await simulateP3SAMSegmentation(
-                params,
-                allMeshIds,
-                pct => setSegmentProgress(pct),
-                controller.signal
-            );
+            if (!sceneRef.current || !activeAssetId) throw new Error('No model loaded');
+
+            // 1. Export current scene as GLB
+            setSegmentProgress(10);
+            const exporter = new GLTFExporter();
+            const glbBuffer = await new Promise<ArrayBuffer>((resolve, reject) => {
+                exporter.parse(
+                    sceneRef.current!,
+                    (result) => resolve(result as ArrayBuffer),
+                    (err) => reject(err),
+                    { binary: true }
+                );
+            });
+
+            if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            setSegmentProgress(20);
+
+            // 2. POST to P3-SAM
+            const glbFile = new File([glbBuffer], 'model.glb', { type: 'model/gltf-binary' });
+            const segResult = await segment3D(glbFile, {
+                point_num: params.point_num,
+                prompt_num: params.prompt_num,
+                threshold: params.threshold,
+                post_process: params.post_process,
+                clean_mesh: params.clean_mesh_flag,
+                seed: params.seed,
+                prompt_bs: params.prompt_bs,
+            });
+
+            if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            setSegmentProgress(60);
+
+            // 3. Download segmented GLB from P3-SAM
+            const fileName = segResult.segmented_glb.split('/').pop() || 'segmented_output_parts.glb';
+            const rawBlob = await downloadPhidiasImage(segResult.request_id, fileName, 'p3sam');
+
+            if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            setSegmentProgress(80);
+
+            // 4. Split the single vertex-coloured mesh into one mesh per segment
+            //    so that ThreeViewport has selectable, independent parts.
+            //    No SEGMENT_PALETTE colours are applied — handleSceneGraphChange
+            //    creates parts with color:'', so ThreeViewport never overrides materials.
+            const splitBlob = await splitSegmentedGlb(rawBlob);
+            const segmentedUrl = URL.createObjectURL(splitBlob);
+
+            // 5. Replace model — handleSceneGraphChange fires and creates parts
+            updateAsset(activeAssetId, { modelUrl: segmentedUrl, pipelineUsed: 'segment' });
+
+            // 6. Build result list for the AI results panel
+            const results: SegmentResult[] = Array.from({ length: segResult.num_parts }, (_, i) => ({
+                id: `p3sam-part-${i}`,
+                name: `Part ${i + 1}`,
+                color: SEGMENT_PALETTE[i % SEGMENT_PALETTE.length],
+                score: 1.0,
+                meshIds: [],
+            }));
 
             setAiResults(results);
-
-            // Apply AI results as new parts in the scene
-            const newParts: Part[] = results.map(r => ({
-                id: r.id,
-                name: r.name,
-                color: r.color,
-                visible: true,
-                meshIds: r.meshIds,
-            }));
-            setParts(newParts);
             setSelectedPartIds([]);
             setLastClickedMeshId(null);
+            setSegmentProgress(100);
         } catch (err) {
             if (err instanceof DOMException && err.name === 'AbortError') {
-                // user cancelled — reset quietly
                 setSegmentProgress(0);
             } else {
                 setSegmentError(
@@ -694,7 +771,7 @@ export default function SegmentPage() {
         } finally {
             setIsSegmenting(false);
         }
-    }, [parts]);
+    }, [activeAssetId, updateAsset]);
 
     const handleCancelSegmentation = useCallback(() => {
         abortRef.current?.abort();
