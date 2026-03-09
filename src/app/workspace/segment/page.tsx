@@ -15,7 +15,8 @@ import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useSegmentStore } from '@/store/segment-store';
-import { segment3D, downloadPhidiasImage } from '@/lib/api/phidias';
+import { segment3D, downloadPhidiasImage, smartOrganize } from '@/lib/api/phidias';
+import type { SmartOrganizeResult } from '@/lib/api/phidias';
 
 const ThreeViewport = dynamic(() => import('@/components/shared/ThreeViewport'), {
     ssr: false,
@@ -90,6 +91,61 @@ function partsToHierarchyItems(parts: Part[]): HierarchyItem[] {
         const type: HierarchyItem['type'] = p.meshIds.length > 1 ? 'group' : 'mesh';
         return { id: p.id, name: p.name, visible: p.visible, type };
     });
+}
+
+// ─── Screenshot helpers ──────────────────────────────────────────────────────
+
+/** Render the scene group to a PNG Blob via an offscreen WebGL renderer. */
+async function captureSceneScreenshot(group: THREE.Group): Promise<Blob> {
+    const w = 768, h = 768;
+    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, alpha: false });
+    renderer.setSize(w, h);
+    renderer.setPixelRatio(1);
+    renderer.setClearColor(0x1a1a2e, 1);
+
+    const box = new THREE.Box3().setFromObject(group);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.01, maxDim * 100);
+    const dist = maxDim * 1.8;
+    camera.position.set(center.x + dist * 0.7, center.y + dist * 0.5, center.z + dist * 0.7);
+    camera.lookAt(center);
+
+    // Temporarily reparent into a lit scene for the render
+    const tempScene = new THREE.Scene();
+    tempScene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    const dir = new THREE.DirectionalLight(0xffffff, 1);
+    dir.position.set(1, 2, 1);
+    tempScene.add(dir);
+
+    const savedParent = group.parent;
+    tempScene.add(group); // reparents
+    renderer.render(tempScene, camera);
+    tempScene.remove(group);
+    if (savedParent) savedParent.add(group); // restore
+
+    return new Promise<Blob>((resolve, reject) => {
+        renderer.domElement.toBlob(
+            (blob) => { renderer.dispose(); blob ? resolve(blob) : reject(new Error('Screenshot capture failed')); },
+            'image/png',
+        );
+    });
+}
+
+/** Read the material colour of every Mesh child in the scene group. */
+function getMeshColors(group: THREE.Group): { id: string; color: string }[] {
+    const result: { id: string; color: string }[] = [];
+    group.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+            const mat = child.material as THREE.MeshStandardMaterial;
+            if (mat?.color) {
+                result.push({ id: child.name || child.uuid, color: '#' + mat.color.getHexString() });
+            }
+        }
+    });
+    return result;
 }
 
 // ─── splitSegmentedGlb ────────────────────────────────────────────────────────
@@ -226,6 +282,7 @@ export default function SegmentPage() {
     const [segmentProgress, setSegmentProgress] = useState(0);
     const [segmentError, setSegmentError] = useState<string | null>(null);
     const [aiResults, setAiResults] = useState<SegmentResult[]>([]);
+    const [isOrganizing, setIsOrganizing] = useState(false);
 
     // ── Selection state ────────────────────────────────────────────────────────
     const [selectedPartIds, setSelectedPartIds] = useState<string[]>([]);
@@ -779,6 +836,83 @@ export default function SegmentPage() {
         setSegmentProgress(0);
     }, []);
 
+    // ── Smart Organize (VLM auto-name + auto-group) ─────────────────────────────
+
+    const handleSmartOrganize = useCallback(async () => {
+        if (!sceneRef.current || parts.length === 0) return;
+        setIsOrganizing(true);
+        setSegmentError(null);
+
+        try {
+            // 1. Read material colours from the Three.js meshes
+            const meshColors = getMeshColors(sceneRef.current);
+
+            // 2. Capture an offscreen screenshot for the VLM
+            const screenshot = await captureSceneScreenshot(sceneRef.current);
+
+            // 3. Call VLM API
+            const results: SmartOrganizeResult[] = await smartOrganize(screenshot, meshColors);
+
+            // 4. Rename parts
+            let newParts = parts.map((p) => {
+                const match = results.find((r) => r.id === p.id);
+                return match ? { ...p, name: match.name } : p;
+            });
+
+            // 5. Build groups from VLM suggestions
+            const groupMap = new Map<string, string[]>();
+            for (const r of results) {
+                if (!r.group) continue;
+                if (!groupMap.has(r.group)) groupMap.set(r.group, []);
+                groupMap.get(r.group)!.push(r.id);
+            }
+
+            for (const [groupName, memberIds] of Array.from(groupMap.entries())) {
+                if (memberIds.length < 2) continue; // only group 2+ parts
+                const groupId = `group_${groupName.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}`;
+                const groupPart: Part = {
+                    id: groupId,
+                    name: groupName,
+                    color: '',
+                    visible: true,
+                    meshIds: [],
+                    isGroup: true,
+                    childIds: memberIds,
+                };
+                // Set parentId on children
+                newParts = newParts.map((p) =>
+                    memberIds.includes(p.id) ? { ...p, parentId: groupId } : p,
+                );
+                // Insert group before its first child
+                const firstIdx = newParts.findIndex((p) => memberIds.includes(p.id));
+                newParts.splice(firstIdx, 0, groupPart);
+            }
+
+            setParts(newParts);
+
+            // Rebuild Three.js groups to match
+            if (sceneRef.current) {
+                for (const part of newParts) {
+                    if (!part.isGroup || !part.childIds || part.childIds.length < 2) continue;
+                    const threeGroup = new THREE.Group();
+                    threeGroup.name = part.id;
+                    const childMeshIds = part.childIds.flatMap(
+                        (cid) => newParts.find((p) => p.id === cid)?.meshIds ?? [],
+                    );
+                    const meshObjs = childMeshIds
+                        .map((mid) => findObjectInScene(sceneRef.current!, mid))
+                        .filter((o): o is THREE.Object3D => o !== null);
+                    sceneRef.current.add(threeGroup);
+                    meshObjs.forEach((obj) => threeGroup.attach(obj));
+                }
+            }
+        } catch (err) {
+            setSegmentError(err instanceof Error ? err.message : 'Smart organize failed');
+        } finally {
+            setIsOrganizing(false);
+        }
+    }, [parts, setParts]);
+
     // Cleanup on unmount
     useEffect(() => {
         return () => { abortRef.current?.abort(); };
@@ -854,6 +988,8 @@ export default function SegmentPage() {
                         results={aiResults}
                         onStart={handleStartSegmentation}
                         onCancel={handleCancelSegmentation}
+                        onSmartOrganize={handleSmartOrganize}
+                        isOrganizing={isOrganizing}
                     />
                 </div>
             </aside>

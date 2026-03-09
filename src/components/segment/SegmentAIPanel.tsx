@@ -211,6 +211,8 @@ interface SegmentAIPanelProps {
     results: SegmentResult[];
     onStart: (params: P3SAMParams) => void;
     onCancel: () => void;
+    onSmartOrganize?: () => void;
+    isOrganizing?: boolean;
 }
 
 type SectionKey = 'sampling' | 'detection' | 'postprocess' | 'advanced';
@@ -223,6 +225,8 @@ export default function SegmentAIPanel({
     results,
     onStart,
     onCancel,
+    onSmartOrganize,
+    isOrganizing,
 }: SegmentAIPanelProps) {
     const [params, setParams] = useState<P3SAMParams>(DEFAULT_PARAMS);
     const [openSections, setOpenSections] = useState<Record<SectionKey, boolean>>({
@@ -516,6 +520,44 @@ export default function SegmentAIPanel({
                     </div>
                 )
             }
+
+            {/* ── Smart Organize ─────────────────────────────────────────────── */}
+            {results.length > 0 && !isSegmenting && onSmartOrganize && (
+                <div
+                    className="flex-shrink-0 p-3 border-t"
+                    style={{ borderColor: '#333355' }}
+                >
+                    <button
+                        onClick={onSmartOrganize}
+                        disabled={isOrganizing}
+                        className={cn(
+                            'w-full py-2.5 rounded-xl text-sm font-bold transition-opacity hover:opacity-90',
+                            isOrganizing ? 'cursor-not-allowed opacity-60' : 'cursor-pointer',
+                        )}
+                        style={{
+                            background: isOrganizing
+                                ? '#252542'
+                                : 'linear-gradient(135deg, #7c3aed, #D5B451)',
+                            color: isOrganizing ? '#64748b' : '#fff',
+                        }}
+                    >
+                        {isOrganizing ? (
+                            <span className="flex items-center justify-center gap-2">
+                                <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                                Organizing...
+                            </span>
+                        ) : (
+                            'Smart Organize'
+                        )}
+                    </button>
+                    <p
+                        className="text-center text-[9px] mt-1.5"
+                        style={{ color: '#4b5563' }}
+                    >
+                        Uses VLM to auto-name parts &amp; create groups
+                    </p>
+                </div>
+            )}
         </div >
     );
 }

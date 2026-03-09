@@ -250,6 +250,36 @@ export async function classifyPart(image: string, categories: string[], settings
     return data;
 }
 
+// ── Smart Organize (VLM-based auto naming + grouping) ────────────────────────
+
+export interface SmartOrganizeResult {
+    id: string;
+    name: string;
+    group: string;
+}
+
+export async function smartOrganize(
+    screenshot: Blob,
+    parts: { id: string; color: string }[],
+): Promise<SmartOrganizeResult[]> {
+    const formData = new FormData();
+    formData.append('screenshot', screenshot, 'screenshot.png');
+    formData.append('parts', JSON.stringify(parts));
+
+    const res = await fetch('/api/phidias/smart-organize', {
+        method: 'POST',
+        body: formData,
+    });
+
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: 'Unknown error' }));
+        throw new Error(err.error || `Smart organize failed (${res.status})`);
+    }
+
+    const data = await res.json();
+    return data.parts;
+}
+
 export async function generateReconSingle(
     file: File | Blob,
     params: {
