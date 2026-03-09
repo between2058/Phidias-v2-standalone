@@ -1,10 +1,31 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY ?? '';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? '';
+// ── VLM configuration via environment variables ──────────────────────────────
+// VLM_API_URL : base URL (e.g. https://api.openai.com/v1, or a self-hosted endpoint)
+// VLM_API_KEY : bearer token / API key
+// VLM_MODEL   : model name  (default: gpt-4o)
+//
+// Supports any OpenAI-compatible chat-completion endpoint (OpenAI, Azure,
+// vLLM, Ollama, LM Studio, Together, etc.) and Anthropic Messages API.
+// The route auto-detects Anthropic when the URL contains "anthropic".
+
+const VLM_API_URL = process.env.VLM_API_URL ?? '';
+const VLM_API_KEY = process.env.VLM_API_KEY ?? '';
+const VLM_MODEL = process.env.VLM_MODEL ?? 'gpt-4o';
+
+function isAnthropic(): boolean {
+    return VLM_API_URL.includes('anthropic');
+}
 
 export async function POST(request: NextRequest) {
     try {
+        if (!VLM_API_URL || !VLM_API_KEY) {
+            return NextResponse.json(
+                { error: 'VLM not configured. Set VLM_API_URL and VLM_API_KEY in .env' },
+                { status: 500 },
+            );
+        }
+
         const formData = await request.formData();
         const screenshot = formData.get('screenshot') as File | null;
         const partsJson = formData.get('parts') as string | null;
@@ -42,18 +63,9 @@ export async function POST(request: NextRequest) {
             '- Return ONLY the JSON array',
         ].join('\n');
 
-        let result: any[];
-
-        if (ANTHROPIC_API_KEY) {
-            result = await callAnthropic(base64, mime, system, user);
-        } else if (OPENAI_API_KEY) {
-            result = await callOpenAI(base64, mime, system, user);
-        } else {
-            return NextResponse.json(
-                { error: 'No VLM API key configured. Set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env' },
-                { status: 500 },
-            );
-        }
+        const result = isAnthropic()
+            ? await callAnthropic(base64, mime, system, user)
+            : await callOpenAICompat(base64, mime, system, user);
 
         return NextResponse.json({ parts: result });
     } catch (err: any) {
@@ -65,16 +77,21 @@ export async function POST(request: NextRequest) {
     }
 }
 
+// ── Anthropic Messages API ──────────────────────────────────────────────────
+
 async function callAnthropic(b64: string, mime: string, system: string, user: string) {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const url = VLM_API_URL.replace(/\/+$/, '');
+    const endpoint = url.endsWith('/messages') ? url : `${url}/v1/messages`;
+
+    const res = await fetch(endpoint, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            'x-api-key': ANTHROPIC_API_KEY,
+            'x-api-key': VLM_API_KEY,
             'anthropic-version': '2023-06-01',
         },
         body: JSON.stringify({
-            model: process.env.ANTHROPIC_MODEL ?? 'claude-sonnet-4-20250514',
+            model: VLM_MODEL,
             max_tokens: 4096,
             system,
             messages: [
@@ -94,15 +111,22 @@ async function callAnthropic(b64: string, mime: string, system: string, user: st
     return extractJson(data.content?.[0]?.text ?? '');
 }
 
-async function callOpenAI(b64: string, mime: string, system: string, user: string) {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+// ── OpenAI-compatible chat completions ──────────────────────────────────────
+
+async function callOpenAICompat(b64: string, mime: string, system: string, user: string) {
+    const url = VLM_API_URL.replace(/\/+$/, '');
+    const endpoint = url.endsWith('/chat/completions')
+        ? url
+        : `${url}/chat/completions`;
+
+    const res = await fetch(endpoint, {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
+            Authorization: `Bearer ${VLM_API_KEY}`,
         },
         body: JSON.stringify({
-            model: process.env.OPENAI_MODEL ?? 'gpt-4o',
+            model: VLM_MODEL,
             max_tokens: 4096,
             messages: [
                 { role: 'system', content: system },
@@ -117,7 +141,7 @@ async function callOpenAI(b64: string, mime: string, system: string, user: strin
         }),
     });
 
-    if (!res.ok) throw new Error(`OpenAI API ${res.status}: ${await res.text()}`);
+    if (!res.ok) throw new Error(`VLM API ${res.status}: ${await res.text()}`);
     const data = await res.json();
     return extractJson(data.choices?.[0]?.message?.content ?? '');
 }
