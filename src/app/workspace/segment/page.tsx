@@ -251,6 +251,11 @@ export default function SegmentPage() {
     const sceneRef = useRef<THREE.Group | null>(null);
     const abortRef = useRef<AbortController | null>(null);
 
+    // When true, the next handleSceneGraphChange call assigns SEGMENT_PALETTE
+    // colours to the newly created parts (set right before model replacement
+    // after segmentation).
+    const pendingColorRef = useRef(false);
+
     // ── Mesh registry for scene rebuild on undo/redo ──────────────────────────
     // meshRegistryRef: meshId → { obj, origParent } — built at scene-ready time
     const meshRegistryRef = useRef<Map<string, { obj: THREE.Object3D; origParent: THREE.Object3D }>>(new Map());
@@ -273,8 +278,14 @@ export default function SegmentPage() {
     // can call the latest version without being a stale closure.
     const rebuildRef = useRef<(parts: Part[]) => void>(() => { });
 
+    // ── View mode: 'original' shows native materials, 'colored' shows palette ──
+    const [viewMode, setViewMode] = useState<'original' | 'colored'>('original');
+
     // Derive colors and meshId map from parts (replaces explicit setState calls)
-    const segmentColors = useMemo(() => buildSegmentColors(parts), [parts]);
+    const segmentColors = useMemo(() => {
+        if (viewMode === 'original') return {};
+        return buildSegmentColors(parts);
+    }, [parts, viewMode]);
     const meshToPartId = useMemo(() => buildMeshToPartId(parts), [parts]);
 
     // AI segmentation state
@@ -423,11 +434,15 @@ export default function SegmentPage() {
 
     const handleSceneGraphChange = useCallback((nodes: HierarchyItem[]) => {
         const meshes = flattenMeshes(nodes);
-        // color: '' → segmentColors won't override the mesh's original material
-        const newParts: Part[] = meshes.map((m) => ({
+        const assignColors = pendingColorRef.current;
+        if (assignColors) {
+            pendingColorRef.current = false;
+            setViewMode('colored');
+        }
+        const newParts: Part[] = meshes.map((m, i) => ({
             id: m.id,
             name: m.name,
-            color: '',
+            color: assignColors ? SEGMENT_PALETTE[i % SEGMENT_PALETTE.length] : '',
             visible: m.visible,
             meshIds: [m.id],
         }));
@@ -802,6 +817,8 @@ export default function SegmentPage() {
             const segmentedUrl = URL.createObjectURL(splitBlob);
 
             // 5. Replace model — handleSceneGraphChange fires and creates parts
+            //    pendingColorRef tells it to assign SEGMENT_PALETTE colours.
+            pendingColorRef.current = true;
             updateAsset(activeAssetId, { modelUrl: segmentedUrl, pipelineUsed: 'segment' });
 
             // 6. Build result list for the AI results panel
@@ -1022,6 +1039,38 @@ export default function SegmentPage() {
                         className="w-full h-full"
                     />
                 </Suspense>
+
+                {/* View-mode toggle: Original ↔ Colored (only after segmentation) */}
+                {parts.some(p => p.color !== '') && !isSegmenting && (
+                    <div
+                        className="absolute top-4 right-4 flex rounded-lg overflow-hidden z-10"
+                        style={{
+                            background: 'rgba(13,13,24,0.92)',
+                            border: '1px solid #333355',
+                        }}
+                    >
+                        <button
+                            onClick={() => setViewMode('original')}
+                            className="px-3 py-1.5 text-[11px] font-medium transition-colors"
+                            style={{
+                                background: viewMode === 'original' ? '#7c3aed' : 'transparent',
+                                color: viewMode === 'original' ? '#fff' : '#64748b',
+                            }}
+                        >
+                            Original
+                        </button>
+                        <button
+                            onClick={() => setViewMode('colored')}
+                            className="px-3 py-1.5 text-[11px] font-medium transition-colors"
+                            style={{
+                                background: viewMode === 'colored' ? '#7c3aed' : 'transparent',
+                                color: viewMode === 'colored' ? '#fff' : '#64748b',
+                            }}
+                        >
+                            Colored
+                        </button>
+                    </div>
+                )}
 
                 {/* AI mode progress overlay on viewport */}
                 {isSegmenting && (
