@@ -294,7 +294,7 @@ async function splitSegmentedGlb(blob: Blob): Promise<Blob> {
 // ─── Page component ──────────────────────────────────────────────────────────
 
 export default function SegmentPage() {
-    const { setSceneGraph, setSegmentHierarchy, assets, activeAssetId, updateAsset } = useWorkspace();
+    const { setSceneGraph, setSegmentHierarchy, assets, activeAssetId, updateAsset, updateAssetThumbnail } = useWorkspace();
     const activeModelUrl = assets.find(a => a.id === activeAssetId)?.modelUrl ?? null;
 
     const sceneRef = useRef<THREE.Group | null>(null);
@@ -334,10 +334,34 @@ export default function SegmentPage() {
         return stored.some(p => p.color !== '') ? 'colored' : 'original';
     });
 
+    // When switching to colored mode, auto-assign palette colors to parts that lack them
+    const handleViewModeChange = useCallback((mode: 'original' | 'colored') => {
+        if (mode === 'colored') {
+            const current = useSegmentStore.getState().parts;
+            const needsColors = current.filter(p => !p.isGroup && !p.color);
+            if (needsColors.length > 0) {
+                const updated = current.map((p, i) => {
+                    if (!p.isGroup && !p.color) {
+                        return { ...p, color: SEGMENT_PALETTE[i % SEGMENT_PALETTE.length] };
+                    }
+                    return p;
+                });
+                setParts(updated);
+            }
+        }
+        setViewMode(mode);
+    }, [setParts]);
+
     // Derive colors and meshId map from parts (replaces explicit setState calls)
     const segmentColors = useMemo(() => {
         if (viewMode === 'original') return {};
-        return buildSegmentColors(parts);
+        // Build colors with fallback for parts that somehow still lack a color
+        const colors: Record<string, string> = {};
+        parts.forEach((p, i) => {
+            const color = p.color || SEGMENT_PALETTE[i % SEGMENT_PALETTE.length];
+            p.meshIds.forEach(mid => { colors[mid] = color; });
+        });
+        return colors;
     }, [parts, viewMode]);
     const meshToPartId = useMemo(() => buildMeshToPartId(parts), [parts]);
 
@@ -492,11 +516,17 @@ export default function SegmentPage() {
             pendingColorRef.current = false;
         }
 
-        // Auto-assign colors when a natively multi-part model is loaded
-        // for the first time (no existing parts in store yet).
+        // Auto-assign colors when a natively multi-part model is loaded.
+        // Triggers when: (a) store is empty, or (b) mesh IDs don't match existing parts
+        // (indicating a new/different model was loaded).
         const existing = useSegmentStore.getState().parts;
-        if (!assignColors && existing.length === 0 && meshes.length > 1) {
-            assignColors = true;
+        if (!assignColors && meshes.length > 1) {
+            const existingMeshIds = new Set(existing.flatMap(p => p.meshIds));
+            const newMeshIds = meshes.map(m => m.id);
+            const isNewModel = existing.length === 0 || newMeshIds.some(id => !existingMeshIds.has(id));
+            if (isNewModel) {
+                assignColors = true;
+            }
         }
 
         if (assignColors) {
@@ -1191,42 +1221,13 @@ export default function SegmentPage() {
                         onSceneGraphChange={handleSceneGraphChange}
                         segmentColors={segmentColors}
                         isGenerating={isSegmenting}
+                        onThumbnailReady={(dataUrl) => { if (activeAssetId) updateAssetThumbnail(activeAssetId, dataUrl); }}
                         onHasSkinnedMesh={(v) => { if (activeAssetId) updateAsset(activeAssetId, { hasSkinnedMesh: v }); }}
+                        colorViewMode={!isSegmenting ? viewMode : undefined}
+                        onColorViewModeChange={handleViewModeChange}
                         className="w-full h-full"
                     />
                 </Suspense>
-
-                {/* View-mode toggle: Original ↔ Colored (only after segmentation) */}
-                {parts.some(p => p.color !== '') && !isSegmenting && (
-                    <div
-                        className="absolute top-4 right-4 flex rounded-lg overflow-hidden z-10"
-                        style={{
-                            background: 'rgba(13,13,24,0.92)',
-                            border: '1px solid #333355',
-                        }}
-                    >
-                        <button
-                            onClick={() => setViewMode('original')}
-                            className="px-3 py-1.5 text-[11px] font-medium transition-colors"
-                            style={{
-                                background: viewMode === 'original' ? '#7c3aed' : 'transparent',
-                                color: viewMode === 'original' ? '#fff' : '#64748b',
-                            }}
-                        >
-                            Original
-                        </button>
-                        <button
-                            onClick={() => setViewMode('colored')}
-                            className="px-3 py-1.5 text-[11px] font-medium transition-colors"
-                            style={{
-                                background: viewMode === 'colored' ? '#7c3aed' : 'transparent',
-                                color: viewMode === 'colored' ? '#fff' : '#64748b',
-                            }}
-                        >
-                            Colored
-                        </button>
-                    </div>
-                )}
 
                 {/* AI mode progress overlay on viewport */}
                 {isSegmenting && (

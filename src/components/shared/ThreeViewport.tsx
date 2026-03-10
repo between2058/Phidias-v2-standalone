@@ -103,6 +103,10 @@ export interface ThreeViewportProps {
     onThumbnailReady?: (dataUrl: string) => void;
     /** Called after the model loads, true if any SkinnedMesh was found */
     onHasSkinnedMesh?: (value: boolean) => void;
+    /** Current color view mode (original vs colored) — shown in right toolbar when provided */
+    colorViewMode?: 'original' | 'colored';
+    /** Called when the user toggles the color view mode */
+    onColorViewModeChange?: (mode: 'original' | 'colored') => void;
 }
 
 // ─── Error Boundary ────────────────────────────────────────────────────────────
@@ -272,7 +276,7 @@ function GLBModel({
             if (!(child instanceof THREE.Mesh)) return;
             const oid = objectId(child);
 
-            // Segment color override (flat material — Outline handles selection highlight)
+            // Segment color override with selection highlight
             const segColor = segmentColors && (segmentColors[oid] ?? segmentColors[child.name]);
             if (segColor) {
                 // Save original material before first override
@@ -282,10 +286,13 @@ function GLBModel({
                 // Also stash on the mesh itself so external code (e.g. export)
                 // can restore original materials without accessing this ref.
                 child.userData.__origMaterial = origMaterialsRef.current.get(oid);
+                const highlighted = isHighlighted(child);
                 child.material = new THREE.MeshStandardMaterial({
                     color: segColor,
                     roughness: 0.6,
                     metalness: 0.1,
+                    emissive: highlighted ? new THREE.Color(segColor) : new THREE.Color(0),
+                    emissiveIntensity: highlighted ? 0.4 : 0,
                 });
                 return;
             }
@@ -1124,11 +1131,14 @@ function ViewportSettingsToolbar({
     grounded, onToggleGround,
     envIntensity, onEnvIntensityChange,
     envRotation, onEnvRotationChange,
+    colorViewMode, onColorViewModeChange,
 }: {
     gridVisible: boolean; onToggleGrid: () => void;
     grounded: boolean; onToggleGround: () => void;
     envIntensity: number; onEnvIntensityChange: (v: number) => void;
     envRotation: number; onEnvRotationChange: (v: number) => void;
+    colorViewMode?: 'original' | 'colored';
+    onColorViewModeChange?: (mode: 'original' | 'colored') => void;
 }) {
     const [envOpen, setEnvOpen] = useState(false);
     const panelRef = useRef<HTMLDivElement>(null);
@@ -1194,6 +1204,22 @@ function ViewportSettingsToolbar({
                     backdropFilter: 'blur(8px)',
                 }}
             >
+                {/* Color View Mode toggle */}
+                {colorViewMode && onColorViewModeChange && (
+                    <>
+                        <button
+                            onClick={() => onColorViewModeChange(colorViewMode === 'original' ? 'colored' : 'original')}
+                            title={colorViewMode === 'original' ? 'Show colored parts' : 'Show original textures'}
+                            style={colorViewMode === 'colored' ? btnOn : btnOff}
+                        >
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <circle cx="12" cy="12" r="10" /><path d="M12 2a15 15 0 0 1 0 20" /><path d="M12 2a15 15 0 0 0 0 20" /><path d="M2 12h20" />
+                            </svg>
+                        </button>
+                        <div style={{ width: 24, height: 1, background: 'rgba(26,58,90,0.5)' }} />
+                    </>
+                )}
+
                 {/* Environment */}
                 <button
                     onClick={() => setEnvOpen(v => !v)}
@@ -1429,6 +1455,8 @@ export default function ThreeViewport({
     onObjectMultiSelect,
     onThumbnailReady,
     onHasSkinnedMesh,
+    colorViewMode,
+    onColorViewModeChange,
 }: ThreeViewportProps) {
     const [isFirstPerson, setIsFirstPerson] = useState(false);
     const [sceneStats, setSceneStats] = useState({ faces: 0, vertices: 0 });
@@ -1612,6 +1640,8 @@ export default function ThreeViewport({
                 onEnvIntensityChange={setEnvIntensity}
                 envRotation={envRotation}
                 onEnvRotationChange={setEnvRotation}
+                colorViewMode={colorViewMode}
+                onColorViewModeChange={onColorViewModeChange}
             />
 
             {/* First-person crosshair */}

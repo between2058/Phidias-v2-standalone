@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useRef, useState, useCallback, useEffect, Suspense } from 'react';
+import React, { useRef, useState, useCallback, useEffect, useMemo, Suspense } from 'react';
 import dynamic from 'next/dynamic';
 import type * as THREE from 'three';
 import { cn } from '@/lib/utils';
@@ -40,6 +40,24 @@ const ThreeViewport = dynamic(() => import('@/components/shared/ThreeViewport'),
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+const SEGMENT_PALETTE = [
+    '#ef4444', '#3b82f6', '#22c55e', '#f59e0b',
+    '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16',
+    '#f97316', '#a855f7', '#14b8a6', '#eab308',
+];
+
+function flattenMeshes(items: HierarchyItem[]): HierarchyItem[] {
+    const result: HierarchyItem[] = [];
+    function walk(nodes: HierarchyItem[]) {
+        for (const n of nodes) {
+            if (n.type === 'mesh') result.push(n);
+            if (n.children) walk(n.children);
+        }
+    }
+    walk(items);
+    return result;
+}
+
 /** Download a GLB from the reconviagen proxy and return an object URL */
 async function downloadGlb(glbUrl: string, requestId: string): Promise<string> {
     const fileName = glbUrl.split('/').pop() || 'model.glb';
@@ -69,6 +87,20 @@ export default function ModelPage() {
     const [selectedTransform, setSelectedTransform] = useState<TransformValues | null>(null);
     const [sceneGraph, setLocalSceneGraph] = useState<HierarchyItem[]>([]);
     const [showGrid, setShowGrid] = useState(false);
+    const [colorViewMode, setColorViewMode] = useState<'original' | 'colored'>('original');
+
+    // Auto-derive segment colors from scene graph meshes
+    const segmentColors = useMemo(() => {
+        if (colorViewMode === 'original') return undefined;
+        const meshes = flattenMeshes(sceneGraph);
+        if (meshes.length <= 1) return undefined;
+        const colors: Record<string, string> = {};
+        meshes.forEach((m, i) => { colors[m.id] = SEGMENT_PALETTE[i % SEGMENT_PALETTE.length]; });
+        return colors;
+    }, [colorViewMode, sceneGraph]);
+
+    // Determine if the model has multiple parts (to show toggle)
+    const hasMultipleParts = useMemo(() => flattenMeshes(sceneGraph).length > 1, [sceneGraph]);
 
     /** URL of the Qwen-generated image shown as a preview thumbnail in the panel */
     const [text2ImgPreviewUrl, setText2ImgPreviewUrl] = useState<string | null>(null);
@@ -134,6 +166,7 @@ export default function ModelPage() {
         setSelectedObjectIds([]);
         setSelectedTransform(null);
         setLocalSceneGraph([]);
+        setColorViewMode('original');
         sceneRef.current = null;
     }, [activeAssetId]);
 
@@ -325,6 +358,9 @@ export default function ModelPage() {
                                 isGenerating={isGenerating}
                                 onThumbnailReady={handleThumbnailReady}
                                 onHasSkinnedMesh={handleHasSkinnedMesh}
+                                segmentColors={segmentColors}
+                                colorViewMode={colorViewMode}
+                                onColorViewModeChange={setColorViewMode}
                                 className="w-full h-full"
                             />
                         </Suspense>
