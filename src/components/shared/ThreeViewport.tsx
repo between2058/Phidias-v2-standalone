@@ -420,23 +420,32 @@ function PLYPointCloud({ url }: { url: string }) {
 
 // ─── Scene Lighting ───────────────────────────────────────────────────────────
 
-function SceneLighting({ hdrUrl }: { hdrUrl?: string }) {
+const DEFAULT_HDR = '/hdri/qwantani_moon_noon_puresky_4k.hdr';
+
+function SceneLighting({ hdrUrl, envIntensity = 1.2, envRotation = 0 }: {
+    hdrUrl?: string;
+    envIntensity?: number;
+    envRotation?: number;
+}) {
+    const envFile = hdrUrl || DEFAULT_HDR;
+    const rotY = (envRotation * Math.PI) / 180; // degrees → radians
     return (
         <>
-            <ambientLight intensity={0.4} />
+            <ambientLight intensity={0.15} />
             <directionalLight
                 position={[5, 10, 5]}
-                intensity={1.0}
+                intensity={0.4}
                 castShadow
                 shadow-mapSize-width={1024}
                 shadow-mapSize-height={1024}
             />
-            <directionalLight position={[-5, 5, -5]} intensity={0.3} />
-            {hdrUrl ? (
-                <Environment files={hdrUrl} background={false} />
-            ) : (
-                <Environment preset="city" background={false} />
-            )}
+            <directionalLight position={[-5, 5, -5]} intensity={0.15} />
+            <Environment
+                files={envFile}
+                background={false}
+                environmentIntensity={envIntensity}
+                environmentRotation={[0, rotY, 0]}
+            />
         </>
     );
 }
@@ -606,12 +615,16 @@ interface MainSceneProps
     onSceneStats?: (stats: { faces: number; vertices: number }) => void;
     isFirstPerson?: boolean;
     onExitFirstPerson?: () => void;
+    /** Snap model bottom to y=0 grid plane */
+    grounded?: boolean;
+    envIntensity?: number;
+    envRotation?: number;
 }
 
 function MainScene({
     modelUrl,
     pointCloudUrl,
-    showGrid = true,
+    showGrid = false,
     showAxes = true,
     transformMode = null,
     renderMode = 'textured',
@@ -634,6 +647,9 @@ function MainScene({
     onObjectMultiSelect,
     onThumbnailReady,
     onHasSkinnedMesh: onHasSkinnedMeshProp,
+    grounded = false,
+    envIntensity,
+    envRotation,
 }: MainSceneProps) {
     const modelGroupRef = useRef<THREE.Group>(null);
     const [selectedObject, setSelectedObject] = useState<THREE.Object3D | null>(null);
@@ -691,10 +707,26 @@ function MainScene({
 
     const isSelected = Boolean(selectedObjectId);
 
+    // Ground the model: shift the group so the bounding box bottom sits at y=0
+    const groundOffsetRef = useRef(0);
+    useEffect(() => {
+        const group = modelGroupRef.current;
+        if (!group) return;
+        // Undo previous offset first
+        group.position.y -= groundOffsetRef.current;
+        groundOffsetRef.current = 0;
+        if (!grounded) return;
+        const box = new THREE.Box3().setFromObject(group);
+        if (box.isEmpty()) return;
+        const offset = -box.min.y;
+        group.position.y += offset;
+        groundOffsetRef.current = offset;
+    }, [grounded, modelUrl]);
+
     return (
         <>
             <PerspectiveCamera makeDefault fov={45} near={0.1} far={1000} position={[0, 2, 5]} />
-            <SceneLighting hdrUrl={hdrUrl} />
+            <SceneLighting hdrUrl={hdrUrl} envIntensity={envIntensity} envRotation={envRotation} />
 
             {/* Grid */}
             {showGrid && (
@@ -960,6 +992,183 @@ function FirstPersonHint({ onExit }: { onExit: () => void }) {
     );
 }
 
+// ─── Viewport Settings Toolbar (right-side) ──────────────────────────────────
+
+function ViewportSettingsToolbar({
+    gridVisible, onToggleGrid,
+    grounded, onToggleGround,
+    envIntensity, onEnvIntensityChange,
+    envRotation, onEnvRotationChange,
+}: {
+    gridVisible: boolean; onToggleGrid: () => void;
+    grounded: boolean; onToggleGround: () => void;
+    envIntensity: number; onEnvIntensityChange: (v: number) => void;
+    envRotation: number; onEnvRotationChange: (v: number) => void;
+}) {
+    const [envOpen, setEnvOpen] = useState(false);
+    const panelRef = useRef<HTMLDivElement>(null);
+
+    // Close popover on outside click
+    useEffect(() => {
+        if (!envOpen) return;
+        const handler = (e: MouseEvent) => {
+            if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
+                setEnvOpen(false);
+            }
+        };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
+    }, [envOpen]);
+
+    const btnBase: React.CSSProperties = {
+        width: 40, height: 40,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        borderRadius: '50%',
+        border: 'none',
+        cursor: 'pointer',
+        transition: 'background 0.15s, color 0.15s',
+    };
+
+    const btnOff: React.CSSProperties = {
+        ...btnBase,
+        background: 'transparent',
+        color: '#64748b',
+    };
+
+    const btnOn: React.CSSProperties = {
+        ...btnBase,
+        background: 'rgba(213,180,81,0.15)',
+        color: '#D5B451',
+    };
+
+    return (
+        <div
+            ref={panelRef}
+            style={{
+                position: 'absolute',
+                right: 12,
+                top: '50%',
+                transform: 'translateY(-50%)',
+                zIndex: 20,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+            }}
+        >
+            {/* Vertical pill */}
+            <div
+                style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: 2,
+                    padding: '6px 6px',
+                    borderRadius: 24,
+                    background: 'rgba(6,21,37,0.85)',
+                    border: '1px solid rgba(26,58,90,0.5)',
+                    backdropFilter: 'blur(8px)',
+                }}
+            >
+                {/* Environment */}
+                <button
+                    onClick={() => setEnvOpen(v => !v)}
+                    title="Environment Settings"
+                    style={envOpen ? btnOn : btnOff}
+                >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="12" cy="12" r="4" /><path d="M12 2v2" /><path d="M12 20v2" /><path d="M4.93 4.93l1.41 1.41" /><path d="M17.66 17.66l1.41 1.41" /><path d="M2 12h2" /><path d="M20 12h2" /><path d="M6.34 17.66l-1.41 1.41" /><path d="M19.07 4.93l-1.41 1.41" />
+                    </svg>
+                </button>
+
+                <div style={{ width: 24, height: 1, background: 'rgba(26,58,90,0.5)' }} />
+
+                {/* Grid */}
+                <button
+                    onClick={onToggleGrid}
+                    title="Toggle Grid"
+                    style={gridVisible ? btnOn : btnOff}
+                >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /><rect x="14" y="14" width="7" height="7" />
+                    </svg>
+                </button>
+
+                <div style={{ width: 24, height: 1, background: 'rgba(26,58,90,0.5)' }} />
+
+                {/* Ground */}
+                <button
+                    onClick={onToggleGround}
+                    title="Ground model on grid plane"
+                    style={grounded ? btnOn : btnOff}
+                >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M12 5v14" /><path d="M19 12l-7 7-7-7" /><path d="M4 21h16" />
+                    </svg>
+                </button>
+            </div>
+
+            {/* Environment popover */}
+            {envOpen && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        right: 60,
+                        top: 0,
+                        width: 240,
+                        borderRadius: 12,
+                        background: 'rgba(13,13,24,0.97)',
+                        border: '1px solid #333355',
+                        padding: 16,
+                        backdropFilter: 'blur(12px)',
+                        boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+                    }}
+                >
+                    {/* Header */}
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                        <span style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>Environment</span>
+                        <button
+                            onClick={() => setEnvOpen(false)}
+                            style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 16, lineHeight: 1 }}
+                        >
+                            ✕
+                        </button>
+                    </div>
+
+                    {/* Intensity */}
+                    <div style={{ marginBottom: 14 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                            <span style={{ fontSize: 11, color: '#94a3b8' }}>Intensity</span>
+                            <span style={{ fontSize: 11, color: '#e2e8f0', fontFamily: 'monospace' }}>{envIntensity.toFixed(2)}</span>
+                        </div>
+                        <input
+                            type="range"
+                            min={0} max={3} step={0.05}
+                            value={envIntensity}
+                            onChange={e => onEnvIntensityChange(parseFloat(e.target.value))}
+                            style={{ width: '100%', accentColor: '#D5B451', height: 4 }}
+                        />
+                    </div>
+
+                    {/* Rotation */}
+                    <div>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                            <span style={{ fontSize: 11, color: '#94a3b8' }}>Rotation</span>
+                            <span style={{ fontSize: 11, color: '#e2e8f0', fontFamily: 'monospace' }}>{Math.round(envRotation)}°</span>
+                        </div>
+                        <input
+                            type="range"
+                            min={0} max={360} step={1}
+                            value={envRotation}
+                            onChange={e => onEnvRotationChange(parseFloat(e.target.value))}
+                            style={{ width: '100%', accentColor: '#D5B451', height: 4 }}
+                        />
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
 // ─── Split View ───────────────────────────────────────────────────────────────
 
 interface SplitViewportProps
@@ -1069,7 +1278,7 @@ function SplitViewport({
 export default function ThreeViewport({
     modelUrl,
     pointCloudUrl,
-    showGrid = true,
+    showGrid: showGridProp = false,
     showAxes = true,
     transformMode = null,
     renderMode = 'textured',
@@ -1099,6 +1308,10 @@ export default function ThreeViewport({
     const [isFirstPerson, setIsFirstPerson] = useState(false);
     const [sceneStats, setSceneStats] = useState({ faces: 0, vertices: 0 });
     const [hasSkinnedMesh, setHasSkinnedMesh] = useState(false);
+    const [gridVisible, setGridVisible] = useState(showGridProp);
+    const [grounded, setGrounded] = useState(false);
+    const [envIntensity, setEnvIntensity] = useState(1.2);
+    const [envRotation, setEnvRotation] = useState(0);
 
     // Reset SkinnedMesh flag whenever the model URL changes
     useEffect(() => { setHasSkinnedMesh(false); }, [modelUrl]);
@@ -1136,7 +1349,7 @@ export default function ThreeViewport({
                         rightLabel={rightLabel}
                         modelUrl={modelUrl}
                         pointCloudUrl={pointCloudUrl}
-                        showGrid={showGrid}
+                        showGrid={gridVisible}
                         showAxes={showAxes}
                         hdrUrl={hdrUrl}
                     >
@@ -1158,18 +1371,30 @@ export default function ThreeViewport({
                 background: '#1a1a2e',
             }}
         >
+            {/* Radial vignette glow — rendered before Canvas so it sits behind 3D content */}
+            <div
+                style={{
+                    position: 'absolute',
+                    inset: 0,
+                    pointerEvents: 'none',
+                    background: 'radial-gradient(circle at 50% 50%, rgba(150,150,190,0.45) 0%, rgba(80,80,130,0.15) 30%, transparent 65%)',
+                    filter: 'blur(30px)',
+                }}
+            />
+
             <ViewportErrorBoundary>
                 <Suspense fallback={<ViewportLoadingFallback />}>
                     <Canvas
                         shadows
                         gl={{
                             antialias: true,
+                            alpha: true,
                             toneMapping: THREE.ACESFilmicToneMapping,
                             toneMappingExposure: 1.2,
                             outputColorSpace: THREE.SRGBColorSpace,
                             preserveDrawingBuffer: !!onThumbnailReady,
                         }}
-                        style={{ width: '100%', height: '100%', background: '#1a1a2e' }}
+                        style={{ width: '100%', height: '100%', background: 'transparent' }}
                         onPointerMissed={(e) => {
                             if (e.type === 'click') onObjectSelect?.(null);
                         }}
@@ -1178,8 +1403,11 @@ export default function ThreeViewport({
                             <MainScene
                                 modelUrl={modelUrl}
                                 pointCloudUrl={pointCloudUrl}
-                                showGrid={showGrid}
+                                showGrid={gridVisible}
                                 showAxes={showAxes}
+                                grounded={grounded}
+                                envIntensity={envIntensity}
+                                envRotation={envRotation}
                                 transformMode={transformMode}
                                 renderMode={renderMode}
                                 selectedObjectId={selectedObjectId}
@@ -1248,6 +1476,18 @@ export default function ThreeViewport({
                     topology={statsData?.topology ?? 'Triangle'}
                 />
             )}
+
+            {/* Right-side viewport toolbar */}
+            <ViewportSettingsToolbar
+                gridVisible={gridVisible}
+                onToggleGrid={() => setGridVisible(v => !v)}
+                grounded={grounded}
+                onToggleGround={() => setGrounded(v => !v)}
+                envIntensity={envIntensity}
+                onEnvIntensityChange={setEnvIntensity}
+                envRotation={envRotation}
+                onEnvRotationChange={setEnvRotation}
+            />
 
             {/* First-person crosshair */}
             {isFirstPerson && <CrosshairOverlay />}

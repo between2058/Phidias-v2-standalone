@@ -68,7 +68,7 @@ export default function ModelPage() {
     const [selectedObjectIds, setSelectedObjectIds] = useState<string[]>([]);
     const [selectedTransform, setSelectedTransform] = useState<TransformValues | null>(null);
     const [sceneGraph, setLocalSceneGraph] = useState<HierarchyItem[]>([]);
-    const [showGrid, setShowGrid] = useState(true);
+    const [showGrid, setShowGrid] = useState(false);
 
     /** URL of the Qwen-generated image shown as a preview thumbnail in the panel */
     const [text2ImgPreviewUrl, setText2ImgPreviewUrl] = useState<string | null>(null);

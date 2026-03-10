@@ -1172,7 +1172,7 @@ export default function SegmentPage() {
                 <Suspense fallback={null}>
                     <ThreeViewport
                         modelUrl={activeModelUrl ?? ''}
-                        showGrid
+                        showGrid={false}
                         transformMode={lastClickedMeshId ? 'translate' : null}
                         selectedObjectId={lastClickedMeshId ?? undefined}
                         selectedObjectIds={highlightedMeshIds}
