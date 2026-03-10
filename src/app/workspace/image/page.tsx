@@ -98,21 +98,28 @@ export default function ImagePage() {
                     <span className="text-sm text-[#94a3b8]">✨ Select image to generate 3D model</span>
                 </div>
 
-                <div className="flex-1 overflow-y-auto scrollbar-thin p-6">
+                <div className="flex-1 overflow-hidden p-6 flex flex-col">
                     {images.length === 0 ? (
-                        <div className="flex flex-col items-center justify-center h-full min-h-[400px]">
+                        <div className="flex flex-col items-center justify-center flex-1 min-h-[400px]">
                             <div className="text-6xl mb-4 opacity-20">🖼</div>
                             <p className="text-[#64748b] text-sm">Generated images will appear here</p>
                             <p className="text-[#4b5563] text-xs mt-1">Enter a prompt and click Generate</p>
                         </div>
                     ) : (
                         <>
-                            <div className="grid grid-cols-2 gap-4 max-w-2xl mx-auto">
+                            <div
+                                className={cn(
+                                    'grid gap-4 flex-1 min-h-0',
+                                    images.length === 1 && 'grid-cols-1 grid-rows-1',
+                                    images.length === 2 && 'grid-cols-2 grid-rows-1',
+                                    images.length >= 3 && images.length <= 4 && 'grid-cols-2 grid-rows-2',
+                                    images.length >= 5 && 'grid-cols-3 grid-rows-2',
+                                )}
+                            >
                                 {images.map((img) => (
                                     <div
                                         key={img.index}
-                                        className="relative rounded-xl overflow-hidden cursor-pointer group"
-                                        style={{ aspectRatio: '1/1' }}
+                                        className="relative rounded-xl overflow-hidden cursor-pointer group min-h-0"
                                         onMouseEnter={() => setHoveredImage(img.index)}
                                         onMouseLeave={() => setHoveredImage(null)}
                                     >
@@ -120,7 +127,7 @@ export default function ImagePage() {
                                         <img
                                             src={img.url}
                                             alt={`Generated ${img.index + 1}`}
-                                            className="w-full h-full object-cover"
+                                            className="w-full h-full object-contain"
                                         />
 
                                         <div
@@ -161,7 +168,7 @@ export default function ImagePage() {
                             </div>
 
                             {images.length > 1 && (
-                                <div className="mt-4 max-w-2xl mx-auto flex">
+                                <div className="mt-4 flex shrink-0">
                                     <button
                                         onClick={() => handleToMultiView(images.map(img => img.url))}
                                         className="w-full py-3 rounded-xl text-sm font-bold text-[#1a1a2e] flex items-center justify-center gap-2 transition-opacity hover:opacity-90"
