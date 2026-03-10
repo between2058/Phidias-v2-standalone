@@ -13,7 +13,6 @@ export interface P3SAMParams {
     prompt_bs: number;
     post_process: boolean;
     clean_mesh_flag: boolean;
-    save_mid_res: boolean;
     seed: number;
     randomize_seed: boolean;
 }
@@ -36,7 +35,6 @@ const DEFAULT_PARAMS: P3SAMParams = {
     prompt_bs: 32,
     post_process: true,
     clean_mesh_flag: true,
-    save_mid_res: false,
     seed: 42,
     randomize_seed: false,
 };
@@ -48,7 +46,6 @@ const PARAM_DESCRIPTIONS: Record<string, string> = {
     prompt_bs: 'GPU inference batch size (prompt_bs). Reduce if you get out-of-memory errors.',
     post_process: 'AABB-based region merging and gap filling after mask prediction (post_process).',
     clean_mesh_flag: 'Remove degenerate faces and merge near-duplicate vertices before processing (clean_mesh_flag).',
-    save_mid_res: 'Persist intermediate meshes (point cloud, clusters, AABB views) to the output directory (save_mid_res).',
     seed: 'RNG seed for reproducibility. Use the dice button to randomize.',
     multimask_output: 'Return three mask candidates per prompt ranked by confidence — lets you pick the best one.',
     use_previous_mask: 'Use the previous segmentation result as a warm start for the next prediction.',
@@ -372,12 +369,6 @@ export default function SegmentAIPanel({
                                     paramKey="clean_mesh_flag"
                                     value={params.clean_mesh_flag}
                                     onChange={v => setParam('clean_mesh_flag', v)}
-                                />
-                                <ToggleRow
-                                    label="Save Intermediates"
-                                    paramKey="save_mid_res"
-                                    value={params.save_mid_res}
-                                    onChange={v => setParam('save_mid_res', v)}
                                 />
                             </div>
                         )}

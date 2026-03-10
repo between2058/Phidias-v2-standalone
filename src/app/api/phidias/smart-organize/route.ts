@@ -1,14 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 // ── VLM configuration via environment variables ──────────────────────────────
-// VLM_API_URL : base URL (e.g. https://api.openai.com/v1, or a self-hosted endpoint)
-// VLM_API_KEY : bearer token / API key
-// VLM_MODEL   : model name  (default: gpt-4o)
-//
-// Supports any OpenAI-compatible chat-completion endpoint (OpenAI, Azure,
-// vLLM, Ollama, LM Studio, Together, etc.) and Anthropic Messages API.
-// The route auto-detects Anthropic when the URL contains "anthropic".
-
 const VLM_API_URL = process.env.VLM_API_URL ?? '';
 const VLM_API_KEY = process.env.VLM_API_KEY ?? '';
 const VLM_MODEL = process.env.VLM_MODEL ?? 'gpt-4o';
@@ -16,6 +8,54 @@ const VLM_MODEL = process.env.VLM_MODEL ?? 'gpt-4o';
 function isAnthropic(): boolean {
     return VLM_API_URL.includes('anthropic');
 }
+
+// ── Color helpers ────────────────────────────────────────────────────────────
+
+function hexToReadableName(hex: string): string {
+    const h = hex.replace('#', '');
+    const r = parseInt(h.substring(0, 2), 16);
+    const g = parseInt(h.substring(2, 4), 16);
+    const b = parseInt(h.substring(4, 6), 16);
+
+    const rn = r / 255, gn = g / 255, bn = b / 255;
+    const max = Math.max(rn, gn, bn), min = Math.min(rn, gn, bn);
+    const l = (max + min) / 2;
+    let h2 = 0, s = 0;
+    if (max !== min) {
+        const d = max - min;
+        s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        if (max === rn) h2 = ((gn - bn) / d + (gn < bn ? 6 : 0)) * 60;
+        else if (max === gn) h2 = ((bn - rn) / d + 2) * 60;
+        else h2 = ((rn - gn) / d + 4) * 60;
+    }
+
+    if (l < 0.12) return 'black';
+    if (l > 0.9 && s < 0.1) return 'white';
+    if (s < 0.1) return l > 0.6 ? 'light gray' : 'dark gray';
+
+    const names: [number, number, string][] = [
+        [0, 15, 'red'], [15, 40, 'orange'], [40, 65, 'yellow'],
+        [65, 170, 'green'], [170, 200, 'cyan'], [200, 260, 'blue'],
+        [260, 290, 'purple'], [290, 330, 'pink'], [330, 360, 'red'],
+    ];
+    const colorName = names.find(([lo, hi]) => h2 >= lo && h2 < hi)?.[2] ?? 'unknown';
+    const prefix = l < 0.35 ? 'dark ' : l > 0.7 ? 'bright ' : '';
+    return prefix + colorName;
+}
+
+// ── Image processing ─────────────────────────────────────────────────────────
+
+interface ImageData {
+    base64: string;
+    mime: string;
+}
+
+async function fileToBase64(file: File): Promise<ImageData> {
+    const buf = Buffer.from(await file.arrayBuffer());
+    return { base64: buf.toString('base64'), mime: file.type || 'image/png' };
+}
+
+// ── Main handler ─────────────────────────────────────────────────────────────
 
 export async function POST(request: NextRequest) {
     try {
@@ -27,47 +67,98 @@ export async function POST(request: NextRequest) {
         }
 
         const formData = await request.formData();
-        const screenshot = formData.get('screenshot') as File | null;
         const partsJson = formData.get('parts') as string | null;
+        const anglesJson = formData.get('angles') as string | null;
 
-        if (!screenshot || !partsJson) {
-            return NextResponse.json(
-                { error: 'Missing screenshot or parts data' },
-                { status: 400 },
-            );
+        if (!partsJson) {
+            return NextResponse.json({ error: 'Missing parts data' }, { status: 400 });
         }
 
         const parts: { id: string; color: string }[] = JSON.parse(partsJson);
-        const buf = Buffer.from(await screenshot.arrayBuffer());
-        const base64 = buf.toString('base64');
-        const mime = screenshot.type || 'image/png';
+        const angleLabels: string[] = anglesJson ? JSON.parse(anglesJson) : [];
+
+        // Collect multi-view images
+        const originalFiles = formData.getAll('original') as File[];
+        const coloredFiles = formData.getAll('colored') as File[];
+
+        if (originalFiles.length === 0 && coloredFiles.length === 0) {
+            return NextResponse.json({ error: 'No screenshots provided' }, { status: 400 });
+        }
+
+        const originalImages = await Promise.all(originalFiles.map(fileToBase64));
+        const coloredImages = await Promise.all(coloredFiles.map(fileToBase64));
+
+        // Build color legend
+        const colorLegend = parts.map(p => {
+            const readableName = hexToReadableName(p.color);
+            return `  - "${p.id}" → ${readableName} (${p.color})`;
+        }).join('\n');
+
+        // Build angle descriptions
+        const angleDesc = angleLabels.length > 0
+            ? `from ${angleLabels.length} different viewing angles: ${angleLabels.join(', ')}`
+            : 'from multiple viewing angles';
 
         const system = [
-            'You are a 3D asset analyst.',
-            'You are shown a screenshot of a segmented 3D model where each part is a different color.',
-            'Identify what each colored part represents and suggest logical groups.',
-            'Return ONLY a valid JSON array — no markdown fences, no explanation.',
-        ].join(' ');
+            'You are a 3D model part analyst. You receive multi-angle screenshots of a 3D model in two modes:',
+            '1. ORIGINAL TEXTURE — showing the real materials and textures of the model',
+            '2. COLOR-CODED — where each segmented part is rendered in a distinct flat color',
+            '',
+            'Your task: cross-reference the two sets of images to identify what each colored part represents,',
+            'then name and group the parts based on the real-world object you see in the original texture images.',
+            '',
+            'You MUST return ONLY a valid JSON array. No markdown, no explanation, no extra text.',
+        ].join('\n');
 
         const user = [
-            `This 3D model has ${parts.length} segmented parts with these colors:`,
-            ...parts.map((p) => `- ${p.id}: ${p.color}`),
+            `This 3D model has ${parts.length} segmented parts, shown ${angleDesc}.`,
             '',
-            'Return a JSON array naming each part and grouping related parts:',
-            '[{"id":"part_0","name":"Seat","group":"Body"},...]',
+            'The FIRST set of images shows the ORIGINAL TEXTURES — use these to understand WHAT the object is',
+            'and what each region looks like (material, shape, function).',
+            '',
+            'The SECOND set of images shows the same model with COLOR-CODED PARTS — each part is a flat color.',
+            'Use these to understand WHERE each part is and match colors to part IDs.',
+            '',
+            'Color legend (part ID → color in the coded images):',
+            colorLegend,
+            '',
+            'Instructions:',
+            '1. First, identify what the overall 3D object is (e.g. a chair, a car, a character).',
+            '2. Look at the original texture images to understand each region\'s real-world function.',
+            '3. Look at the color-coded images to identify which colored region corresponds to which part ID.',
+            '4. Cross-reference: match each color-coded region to its real-world name from the texture views.',
+            '5. Group related parts (e.g. all legs → "Legs", body panels → "Body").',
+            '',
+            'Output — return ONLY this JSON array:',
+            `[{"id":"${parts[0]?.id ?? 'part_0'}","name":"<descriptive name>","group":"<group name>"},...]`,
             '',
             'Rules:',
-            '- Use concise, descriptive English names (e.g. "Front Left Leg", "Seat Cushion")',
-            '- Group related parts (e.g. all legs → "Legs", body panels → "Body")',
-            '- Every part must appear exactly once',
+            '- Use short, descriptive English names (2-4 words max)',
+            '- Group names: broad categories (e.g. "Legs", "Body", "Head", "Base", "Accessories")',
+            '- Same-type parts MUST share a group (e.g. 4 legs → "Legs")',
+            '- Symmetric parts share a group (e.g. "Left Arm" + "Right Arm" → "Arms")',
+            `- Include ALL ${parts.length} parts — do not skip any`,
+            '- Use multiple viewing angles to identify parts that may be hidden from one view',
             '- Return ONLY the JSON array',
         ].join('\n');
 
-        const result = isAnthropic()
-            ? await callAnthropic(base64, mime, system, user)
-            : await callOpenAICompat(base64, mime, system, user);
+        // Try up to 2 times
+        let lastError: Error | null = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            try {
+                const raw = isAnthropic()
+                    ? await callAnthropic(originalImages, coloredImages, angleLabels, system, user)
+                    : await callOpenAICompat(originalImages, coloredImages, angleLabels, system, user);
 
-        return NextResponse.json({ parts: result });
+                const result = extractAndValidate(raw, parts);
+                return NextResponse.json({ parts: result });
+            } catch (err: any) {
+                lastError = err;
+                console.warn(`[smart-organize] attempt ${attempt + 1} failed:`, err.message);
+            }
+        }
+
+        throw lastError ?? new Error('Smart organize failed after retries');
     } catch (err: any) {
         console.error('[smart-organize]', err);
         return NextResponse.json(
@@ -77,11 +168,153 @@ export async function POST(request: NextRequest) {
     }
 }
 
+// ── Response parsing & validation ────────────────────────────────────────────
+
+function extractAndValidate(
+    rawText: string,
+    inputParts: { id: string; color: string }[],
+): { id: string; name: string; group: string }[] {
+    const parsed = extractJson(rawText);
+
+    if (!Array.isArray(parsed)) {
+        throw new Error('VLM response is not an array');
+    }
+
+    const inputIds = new Set(inputParts.map(p => p.id));
+    const resultMap = new Map<string, { name: string; group: string }>();
+
+    for (const item of parsed) {
+        if (!item || typeof item !== 'object') continue;
+        const id = String(item.id ?? '');
+        const name = String(item.name ?? '').trim();
+        const group = String(item.group ?? '').trim();
+        if (id && inputIds.has(id) && name) {
+            resultMap.set(id, { name, group: group || 'Ungrouped' });
+        }
+    }
+
+    // Fill in missing parts with fallback names
+    const result: { id: string; name: string; group: string }[] = [];
+    for (const p of inputParts) {
+        const match = resultMap.get(p.id);
+        if (match) {
+            result.push({ id: p.id, ...match });
+        } else {
+            const idx = inputParts.indexOf(p);
+            const colorName = hexToReadableName(p.color);
+            result.push({
+                id: p.id,
+                name: `Part ${idx + 1} (${colorName})`,
+                group: 'Ungrouped',
+            });
+        }
+    }
+
+    return result;
+}
+
+function extractJson(text: string): any[] {
+    const trimmed = text.trim();
+    if (trimmed.startsWith('[')) {
+        try { return JSON.parse(trimmed); } catch { /* fall through */ }
+    }
+
+    const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenceMatch) {
+        try { return JSON.parse(fenceMatch[1].trim()); } catch { /* fall through */ }
+    }
+
+    let depth = 0, start = -1;
+    for (let i = 0; i < trimmed.length; i++) {
+        if (trimmed[i] === '[') { if (depth === 0) start = i; depth++; }
+        else if (trimmed[i] === ']') {
+            depth--;
+            if (depth === 0 && start >= 0) {
+                try { return JSON.parse(trimmed.slice(start, i + 1)); } catch { /* continue */ }
+            }
+        }
+    }
+
+    throw new Error('No valid JSON array found in VLM response');
+}
+
+// ── Build multi-image content blocks ─────────────────────────────────────────
+
+function buildImageContentOpenAI(
+    originalImages: ImageData[],
+    coloredImages: ImageData[],
+    angleLabels: string[],
+): any[] {
+    const content: any[] = [];
+
+    // Original texture images first
+    content.push({ type: 'text', text: '--- ORIGINAL TEXTURE VIEWS ---' });
+    for (let i = 0; i < originalImages.length; i++) {
+        const label = angleLabels[i] ?? `angle ${i + 1}`;
+        content.push({ type: 'text', text: `[Original — ${label}]` });
+        content.push({
+            type: 'image_url',
+            image_url: { url: `data:${originalImages[i].mime};base64,${originalImages[i].base64}` },
+        });
+    }
+
+    // Then color-coded images
+    content.push({ type: 'text', text: '--- COLOR-CODED PART VIEWS ---' });
+    for (let i = 0; i < coloredImages.length; i++) {
+        const label = angleLabels[i] ?? `angle ${i + 1}`;
+        content.push({ type: 'text', text: `[Color-coded — ${label}]` });
+        content.push({
+            type: 'image_url',
+            image_url: { url: `data:${coloredImages[i].mime};base64,${coloredImages[i].base64}` },
+        });
+    }
+
+    return content;
+}
+
+function buildImageContentAnthropic(
+    originalImages: ImageData[],
+    coloredImages: ImageData[],
+    angleLabels: string[],
+): any[] {
+    const content: any[] = [];
+
+    content.push({ type: 'text', text: '--- ORIGINAL TEXTURE VIEWS ---' });
+    for (let i = 0; i < originalImages.length; i++) {
+        const label = angleLabels[i] ?? `angle ${i + 1}`;
+        content.push({ type: 'text', text: `[Original — ${label}]` });
+        content.push({
+            type: 'image',
+            source: { type: 'base64', media_type: originalImages[i].mime, data: originalImages[i].base64 },
+        });
+    }
+
+    content.push({ type: 'text', text: '--- COLOR-CODED PART VIEWS ---' });
+    for (let i = 0; i < coloredImages.length; i++) {
+        const label = angleLabels[i] ?? `angle ${i + 1}`;
+        content.push({ type: 'text', text: `[Color-coded — ${label}]` });
+        content.push({
+            type: 'image',
+            source: { type: 'base64', media_type: coloredImages[i].mime, data: coloredImages[i].base64 },
+        });
+    }
+
+    return content;
+}
+
 // ── Anthropic Messages API ──────────────────────────────────────────────────
 
-async function callAnthropic(b64: string, mime: string, system: string, user: string) {
+async function callAnthropic(
+    originalImages: ImageData[],
+    coloredImages: ImageData[],
+    angleLabels: string[],
+    system: string,
+    user: string,
+): Promise<string> {
     const url = VLM_API_URL.replace(/\/+$/, '');
     const endpoint = url.endsWith('/messages') ? url : `${url}/v1/messages`;
+
+    const imageContent = buildImageContentAnthropic(originalImages, coloredImages, angleLabels);
 
     const res = await fetch(endpoint, {
         method: 'POST',
@@ -93,12 +326,13 @@ async function callAnthropic(b64: string, mime: string, system: string, user: st
         body: JSON.stringify({
             model: VLM_MODEL,
             max_tokens: 4096,
+            temperature: 0.2,
             system,
             messages: [
                 {
                     role: 'user',
                     content: [
-                        { type: 'image', source: { type: 'base64', media_type: mime, data: b64 } },
+                        ...imageContent,
                         { type: 'text', text: user },
                     ],
                 },
@@ -108,16 +342,24 @@ async function callAnthropic(b64: string, mime: string, system: string, user: st
 
     if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${await res.text()}`);
     const data = await res.json();
-    return extractJson(data.content?.[0]?.text ?? '');
+    return data.content?.[0]?.text ?? '';
 }
 
 // ── OpenAI-compatible chat completions ──────────────────────────────────────
 
-async function callOpenAICompat(b64: string, mime: string, system: string, user: string) {
+async function callOpenAICompat(
+    originalImages: ImageData[],
+    coloredImages: ImageData[],
+    angleLabels: string[],
+    system: string,
+    user: string,
+): Promise<string> {
     const url = VLM_API_URL.replace(/\/+$/, '');
     const endpoint = url.endsWith('/chat/completions')
         ? url
         : `${url}/chat/completions`;
+
+    const imageContent = buildImageContentOpenAI(originalImages, coloredImages, angleLabels);
 
     const res = await fetch(endpoint, {
         method: 'POST',
@@ -128,12 +370,13 @@ async function callOpenAICompat(b64: string, mime: string, system: string, user:
         body: JSON.stringify({
             model: VLM_MODEL,
             max_tokens: 4096,
+            temperature: 0.2,
             messages: [
                 { role: 'system', content: system },
                 {
                     role: 'user',
                     content: [
-                        { type: 'image_url', image_url: { url: `data:${mime};base64,${b64}` } },
+                        ...imageContent,
                         { type: 'text', text: user },
                     ],
                 },
@@ -143,11 +386,5 @@ async function callOpenAICompat(b64: string, mime: string, system: string, user:
 
     if (!res.ok) throw new Error(`VLM API ${res.status}: ${await res.text()}`);
     const data = await res.json();
-    return extractJson(data.choices?.[0]?.message?.content ?? '');
-}
-
-function extractJson(text: string): any[] {
-    const match = text.match(/\[[\s\S]*\]/);
-    if (!match) throw new Error('No JSON array found in VLM response');
-    return JSON.parse(match[0]);
+    return data.choices?.[0]?.message?.content ?? '';
 }

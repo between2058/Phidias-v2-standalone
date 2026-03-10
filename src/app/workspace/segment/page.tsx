@@ -144,8 +144,81 @@ function partsToHierarchyItems(parts: Part[]): HierarchyItem[] {
 
 // ─── Screenshot helpers ──────────────────────────────────────────────────────
 
-/** Render the scene group to a PNG Blob via an offscreen WebGL renderer. */
-async function captureSceneScreenshot(group: THREE.Group): Promise<Blob> {
+/** Camera angles for multi-view capture: [azimuth°, elevation°, label] */
+const CAPTURE_ANGLES: [number, number, string][] = [
+    [30, 20, 'front-right'],
+    [210, 20, 'back-left'],
+    [120, 60, 'top-side'],
+];
+
+/** Render the scene group from a specific angle to a PNG Blob. */
+function renderFromAngle(
+    renderer: THREE.WebGLRenderer,
+    scene: THREE.Scene,
+    camera: THREE.PerspectiveCamera,
+    group: THREE.Group,
+    center: THREE.Vector3,
+    dist: number,
+    azimuthDeg: number,
+    elevationDeg: number,
+): Promise<Blob> {
+    const az = (azimuthDeg * Math.PI) / 180;
+    const el = (elevationDeg * Math.PI) / 180;
+    camera.position.set(
+        center.x + dist * Math.cos(el) * Math.sin(az),
+        center.y + dist * Math.sin(el),
+        center.z + dist * Math.cos(el) * Math.cos(az),
+    );
+    camera.lookAt(center);
+    renderer.render(scene, camera);
+
+    return new Promise<Blob>((resolve, reject) => {
+        renderer.domElement.toBlob(
+            (blob) => blob ? resolve(blob) : reject(new Error('Screenshot capture failed')),
+            'image/png',
+        );
+    });
+}
+
+/** Swap all mesh materials to segment colors, returns a restore function. */
+function applySegmentColorMaterials(
+    group: THREE.Group,
+    parts: Part[],
+): () => void {
+    const overrides: { mesh: THREE.Mesh; origMat: THREE.Material | THREE.Material[] }[] = [];
+    const colorMap = new Map<string, string>();
+    for (const p of parts) {
+        const color = p.color || '';
+        if (color) p.meshIds.forEach(mid => colorMap.set(mid, color));
+    }
+
+    group.traverse((child) => {
+        if (!(child instanceof THREE.Mesh)) return;
+        const id = child.name || child.uuid;
+        const color = colorMap.get(id);
+        if (color) {
+            overrides.push({ mesh: child, origMat: child.material });
+            child.material = new THREE.MeshStandardMaterial({
+                color, roughness: 0.6, metalness: 0.1,
+            });
+        }
+    });
+
+    return () => {
+        for (const { mesh, origMat } of overrides) {
+            mesh.material = origMat;
+        }
+    };
+}
+
+/**
+ * Capture multi-angle screenshots in both original and colored modes.
+ * Returns { original: Blob[], colored: Blob[] } — one per CAPTURE_ANGLES entry.
+ */
+async function captureMultiViewScreenshots(
+    group: THREE.Group,
+    parts: Part[],
+): Promise<{ original: Blob[]; colored: Blob[] }> {
     const w = 768, h = 768;
     const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, alpha: false });
     renderer.setSize(w, h);
@@ -156,13 +229,10 @@ async function captureSceneScreenshot(group: THREE.Group): Promise<Blob> {
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    const dist = maxDim * 1.8;
 
     const camera = new THREE.PerspectiveCamera(50, 1, 0.01, maxDim * 100);
-    const dist = maxDim * 1.8;
-    camera.position.set(center.x + dist * 0.7, center.y + dist * 0.5, center.z + dist * 0.7);
-    camera.lookAt(center);
 
-    // Temporarily reparent into a lit scene for the render
     const tempScene = new THREE.Scene();
     tempScene.add(new THREE.AmbientLight(0xffffff, 0.8));
     const dir = new THREE.DirectionalLight(0xffffff, 1);
@@ -170,17 +240,28 @@ async function captureSceneScreenshot(group: THREE.Group): Promise<Blob> {
     tempScene.add(dir);
 
     const savedParent = group.parent;
-    tempScene.add(group); // reparents
-    renderer.render(tempScene, camera);
-    tempScene.remove(group);
-    if (savedParent) savedParent.add(group); // restore
+    tempScene.add(group);
 
-    return new Promise<Blob>((resolve, reject) => {
-        renderer.domElement.toBlob(
-            (blob) => { renderer.dispose(); blob ? resolve(blob) : reject(new Error('Screenshot capture failed')); },
-            'image/png',
-        );
-    });
+    // 1. Capture original texture from all angles
+    const original: Blob[] = [];
+    for (const [az, el] of CAPTURE_ANGLES) {
+        original.push(await renderFromAngle(renderer, tempScene, camera, group, center, dist, az, el));
+    }
+
+    // 2. Swap to segment colors and capture from all angles
+    const restoreMaterials = applySegmentColorMaterials(group, parts);
+    const colored: Blob[] = [];
+    for (const [az, el] of CAPTURE_ANGLES) {
+        colored.push(await renderFromAngle(renderer, tempScene, camera, group, center, dist, az, el));
+    }
+    restoreMaterials();
+
+    // Restore parent
+    tempScene.remove(group);
+    if (savedParent) savedParent.add(group);
+    renderer.dispose();
+
+    return { original, colored };
 }
 
 /** Read the material colour of every Mesh child in the scene group. */
@@ -1050,11 +1131,15 @@ export default function SegmentPage() {
             // 1. Read material colours from the Three.js meshes
             const meshColors = getMeshColors(sceneRef.current);
 
-            // 2. Capture an offscreen screenshot for the VLM
-            const screenshot = await captureSceneScreenshot(sceneRef.current);
+            // 2. Capture multi-angle screenshots (original + colored)
+            const { original, colored } = await captureMultiViewScreenshots(sceneRef.current, parts);
 
-            // 3. Call VLM API
-            const results: SmartOrganizeResult[] = await smartOrganize(screenshot, meshColors);
+            // 3. Call VLM API with all images
+            const results: SmartOrganizeResult[] = await smartOrganize(
+                original, colored,
+                CAPTURE_ANGLES.map(([,, label]) => label),
+                meshColors,
+            );
 
             // 4. Rename parts
             let newParts = parts.map((p) => {

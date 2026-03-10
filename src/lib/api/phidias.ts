@@ -259,11 +259,19 @@ export interface SmartOrganizeResult {
 }
 
 export async function smartOrganize(
-    screenshot: Blob,
+    originalScreenshots: Blob[],
+    coloredScreenshots: Blob[],
+    angleLabels: string[],
     parts: { id: string; color: string }[],
 ): Promise<SmartOrganizeResult[]> {
     const formData = new FormData();
-    formData.append('screenshot', screenshot, 'screenshot.png');
+    originalScreenshots.forEach((blob, i) => {
+        formData.append('original', blob, `original_${angleLabels[i] ?? i}.png`);
+    });
+    coloredScreenshots.forEach((blob, i) => {
+        formData.append('colored', blob, `colored_${angleLabels[i] ?? i}.png`);
+    });
+    formData.append('angles', JSON.stringify(angleLabels));
     formData.append('parts', JSON.stringify(parts));
 
     const res = await fetch('/api/phidias/smart-organize', {
