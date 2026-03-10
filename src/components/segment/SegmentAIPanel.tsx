@@ -491,35 +491,7 @@ export default function SegmentAIPanel({
                 )}
             </div>
 
-            {/* ── Results ──────────────────────────────────────────────────────────── */}
-            {
-                results.length > 0 && !isSegmenting && (
-                    <div
-                        className="flex-shrink-0 border-t"
-                        style={{ borderColor: '#333355', maxHeight: 200 }}
-                    >
-                        <div
-                            className="px-3 py-2 flex items-center justify-between border-b"
-                            style={{ borderColor: '#333355' }}
-                        >
-                            <span className="text-xs font-semibold" style={{ color: '#94a3b8' }}>
-                                {results.length} parts detected
-                            </span>
-                            <span
-                                className="text-[9px] px-1.5 py-0.5 rounded-full"
-                                style={{ background: '#22c55e22', color: '#22c55e' }}
-                            >
-                                ✓ Applied
-                            </span>
-                        </div>
-                        <div className="overflow-y-auto scrollbar-thin" style={{ maxHeight: 148 }}>
-                            {results.map(r => (
-                                <ResultRow key={r.id} result={r} />
-                            ))}
-                        </div>
-                    </div>
-                )
-            }
+            {/* Results section removed — part list is shown in the scene graph panel */}
 
             {/* ── Smart Organize ─────────────────────────────────────────────── */}
             {results.length > 0 && !isSegmenting && onSmartOrganize && (
