@@ -279,6 +279,9 @@ function GLBModel({
                 if (!origMaterialsRef.current.has(oid)) {
                     origMaterialsRef.current.set(oid, child.material);
                 }
+                // Also stash on the mesh itself so external code (e.g. export)
+                // can restore original materials without accessing this ref.
+                child.userData.__origMaterial = origMaterialsRef.current.get(oid);
                 child.material = new THREE.MeshStandardMaterial({
                     color: segColor,
                     roughness: 0.6,

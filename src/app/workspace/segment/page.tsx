@@ -66,6 +66,55 @@ function flattenMeshes(items: HierarchyItem[]): HierarchyItem[] {
     return result;
 }
 
+/** Scan the scene graph for merged / group nodes and return Part descriptors. */
+function detectMergedAndGroupNodes(
+    nodes: HierarchyItem[],
+    palette: string[],
+    colorOffset: number,
+): { mergedParts: Part[]; groupParts: Part[]; claimedMeshIds: Set<string> } {
+    const mergedParts: Part[] = [];
+    const groupParts: Part[] = [];
+    const claimedMeshIds = new Set<string>();
+    let idx = colorOffset;
+
+    function walk(items: HierarchyItem[]) {
+        for (const n of items) {
+            if (n.type === 'group' && n.id.startsWith('merged_') && n.children) {
+                const childMeshIds = flattenMeshes(n.children).map(m => m.id);
+                if (childMeshIds.length > 0) {
+                    const color = palette[idx++ % palette.length];
+                    mergedParts.push({
+                        id: n.id,
+                        name: n.name,
+                        color,
+                        visible: n.visible,
+                        meshIds: childMeshIds,
+                    });
+                    childMeshIds.forEach(mid => claimedMeshIds.add(mid));
+                }
+            } else if (n.type === 'group' && n.id.startsWith('group_') && n.children) {
+                // Collect direct child IDs (both mesh parts and merged parts)
+                const childIds = n.children.map(c => c.id);
+                groupParts.push({
+                    id: n.id,
+                    name: n.name || `Group (${childIds.length})`,
+                    color: '#94a3b8',
+                    visible: n.visible,
+                    meshIds: [],
+                    isGroup: true,
+                    childIds,
+                });
+                // Recurse into group children to find nested merged nodes
+                walk(n.children);
+            } else if (n.children) {
+                walk(n.children);
+            }
+        }
+    }
+    walk(nodes);
+    return { mergedParts, groupParts, claimedMeshIds };
+}
+
 function buildSegmentColors(parts: Part[]): Record<string, string> {
     const colors: Record<string, string> = {};
     parts.forEach(p => p.meshIds.forEach(mid => { colors[mid] = p.color; }));
@@ -438,38 +487,99 @@ export default function SegmentPage() {
 
     const handleSceneGraphChange = useCallback((nodes: HierarchyItem[]) => {
         const meshes = flattenMeshes(nodes);
-        const assignColors = pendingColorRef.current;
+        let assignColors = pendingColorRef.current;
         if (assignColors) {
             pendingColorRef.current = false;
+        }
+
+        // Auto-assign colors when a natively multi-part model is loaded
+        // for the first time (no existing parts in store yet).
+        const existing = useSegmentStore.getState().parts;
+        if (!assignColors && existing.length === 0 && meshes.length > 1) {
+            assignColors = true;
+        }
+
+        if (assignColors) {
             setViewMode('colored');
         }
 
-        // Preserve existing part colors/names on tab-switch remounts:
-        // if the store already has parts with matching IDs, carry over their
-        // color, name, and group structure instead of resetting to defaults.
-        const existing = useSegmentStore.getState().parts;
+        // Detect merged_*/group_* groups baked into the GLB scene graph.
+        // This covers both fresh import of a previously-exported GLB and
+        // tab-switch remounts where the store already has merge info.
+        const {
+            mergedParts: sceneMerged,
+            groupParts: sceneGroups,
+            claimedMeshIds: sceneClaimedMeshIds,
+        } = detectMergedAndGroupNodes(nodes, SEGMENT_PALETTE, meshes.length);
+
+        // Preserve existing part colors/names on tab-switch remounts
         const existingMap = new Map(existing.map(p => [p.id, p]));
 
-        const newParts: Part[] = meshes.map((m, i) => {
-            const prev = existingMap.get(m.id);
-            return {
-                id: m.id,
-                name: prev?.name ?? m.name,
-                color: assignColors
-                    ? SEGMENT_PALETTE[i % SEGMENT_PALETTE.length]
-                    : (prev?.color ?? ''),
-                visible: m.visible,
-                meshIds: [m.id],
-                parentId: prev?.parentId,
-            };
-        });
+        // Collect meshIds claimed by store-based merged parts (tab-switch case)
+        const storeMerged = existing.filter(p => !p.isGroup && p.meshIds.length > 1);
+        const allClaimedMeshIds = new Set([
+            ...Array.from(sceneClaimedMeshIds),
+            ...storeMerged.flatMap(p => p.meshIds),
+        ]);
 
-        // Re-insert group parts that still have children in the new mesh set
         const meshIdSet = new Set(meshes.map(m => m.id));
+
+        // Build individual parts for unclaimed meshes
+        const newParts: Part[] = meshes
+            .filter(m => !allClaimedMeshIds.has(m.id))
+            .map((m, i) => {
+                const prev = existingMap.get(m.id);
+                return {
+                    id: m.id,
+                    name: prev?.name ?? m.name,
+                    color: assignColors
+                        ? SEGMENT_PALETTE[i % SEGMENT_PALETTE.length]
+                        : (prev?.color ?? ''),
+                    visible: m.visible,
+                    meshIds: [m.id],
+                    parentId: prev?.parentId,
+                };
+            });
+
+        // Insert merged parts detected from the scene graph (fresh import)
+        for (const mp of sceneMerged) {
+            // If the store already has this merged part, prefer store version (has user edits)
+            const storeVersion = existingMap.get(mp.id);
+            newParts.push(storeVersion ? { ...storeVersion } : mp);
+        }
+
+        // Insert merged parts from the store that aren't in the scene graph (tab-switch)
+        for (const sp of storeMerged) {
+            if (!newParts.some(p => p.id === sp.id) && sp.meshIds.every(mid => meshIdSet.has(mid))) {
+                newParts.push({ ...sp });
+            }
+        }
+
+        // Insert group parts detected from the scene graph (fresh import)
+        for (const gp of sceneGroups) {
+            if (!newParts.some(p => p.id === gp.id)) {
+                // Set parentId on children
+                gp.childIds?.forEach(cid => {
+                    const child = newParts.find(p => p.id === cid);
+                    if (child) child.parentId = gp.id;
+                });
+                // Insert before the first child
+                const insertAt = newParts.findIndex(p => gp.childIds?.includes(p.id));
+                if (insertAt >= 0) {
+                    newParts.splice(insertAt, 0, gp);
+                } else {
+                    newParts.push(gp);
+                }
+            }
+        }
+
+        // Re-insert group parts from the store (tab-switch)
         for (const ep of existing) {
-            if (ep.isGroup && ep.childIds?.some(cid => meshIdSet.has(cid))) {
+            if (ep.isGroup && !newParts.some(p => p.id === ep.id) &&
+                ep.childIds?.some(cid => meshIdSet.has(cid) || newParts.some(p => p.id === cid))
+            ) {
                 const insertAt = newParts.findIndex(p => ep.childIds?.includes(p.id));
-                if (insertAt >= 0 && !newParts.some(p => p.id === ep.id)) {
+                if (insertAt >= 0) {
                     newParts.splice(insertAt, 0, { ...ep });
                 }
             }
@@ -761,15 +871,32 @@ export default function SegmentPage() {
         if (!sceneRef.current || !activeAssetId || isSaving) return;
         setIsSaving(true);
         try {
+            const scene = sceneRef.current!;
+
+            // Temporarily restore original materials so saved GLB has original textures
+            const overrides: { mesh: THREE.Mesh; coloredMat: THREE.Material | THREE.Material[] }[] = [];
+            scene.traverse((child) => {
+                if (child instanceof THREE.Mesh && child.userData.__origMaterial) {
+                    overrides.push({ mesh: child, coloredMat: child.material });
+                    child.material = child.userData.__origMaterial;
+                }
+            });
+
             const exporter = new GLTFExporter();
             const glb = await new Promise<ArrayBuffer>((resolve, reject) => {
                 exporter.parse(
-                    sceneRef.current!,
+                    scene,
                     (result) => resolve(result as ArrayBuffer),
                     (err) => reject(err),
                     { binary: true }
                 );
             });
+
+            // Restore segment-color materials
+            for (const { mesh, coloredMat } of overrides) {
+                mesh.material = coloredMat;
+            }
+
             const blob = new Blob([glb], { type: 'model/gltf-binary' });
             const url = URL.createObjectURL(blob);
             updateAsset(activeAssetId, { modelUrl: url, pipelineUsed: 'segment' });
@@ -1224,7 +1351,7 @@ export default function SegmentPage() {
             ★
           </button>
           <span className="text-xs text-[#f5a623] font-bold">⚡ 55</span> */}
-                    <ExportDropdown />
+                    <ExportDropdown sceneRef={sceneRef} />
                 </div>
             </main>
         </div>

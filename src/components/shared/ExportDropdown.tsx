@@ -1,15 +1,51 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
+import type { MutableRefObject } from 'react';
+import * as THREE from 'three';
 import { Upload, Box, ChevronDown, Globe } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWorkspace } from '@/lib/workspace-context';
 
 interface ExportDropdownProps {
     className?: string;
+    /** When provided, export the live Three.js scene instead of the raw modelUrl. */
+    sceneRef?: MutableRefObject<THREE.Group | null>;
 }
 
 // ── Export helpers ─────────────────────────────────────────────────────────────
+
+/** Export a Three.js scene to a GLB ArrayBuffer.
+ *  Temporarily restores original materials so the export always
+ *  contains the original textures, not segment-color overrides. */
+async function exportSceneToGlb(scene: THREE.Group): Promise<ArrayBuffer> {
+    // Swap segment-color materials → original materials
+    const overrides: { mesh: THREE.Mesh; coloredMat: THREE.Material | THREE.Material[] }[] = [];
+    scene.traverse((child) => {
+        if (child instanceof THREE.Mesh && child.userData.__origMaterial) {
+            overrides.push({ mesh: child, coloredMat: child.material });
+            child.material = child.userData.__origMaterial;
+        }
+    });
+
+    const { GLTFExporter } = await import('three/examples/jsm/exporters/GLTFExporter.js');
+    const exporter = new GLTFExporter();
+    const result = await new Promise<ArrayBuffer>((resolve, reject) => {
+        exporter.parse(
+            scene,
+            (r) => resolve(r as ArrayBuffer),
+            (err) => reject(err),
+            { binary: true },
+        );
+    });
+
+    // Restore segment-color materials
+    for (const { mesh, coloredMat } of overrides) {
+        mesh.material = coloredMat;
+    }
+
+    return result;
+}
 
 /** Download the raw blob URL — already a valid GLB. */
 function downloadGlb(modelUrl: string, baseName: string) {
@@ -19,6 +55,20 @@ function downloadGlb(modelUrl: string, baseName: string) {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+}
+
+/** Export the live Three.js scene and download as GLB. */
+async function downloadGlbFromScene(scene: THREE.Group, baseName: string) {
+    const glb = await exportSceneToGlb(scene);
+    const blob = new Blob([glb], { type: 'model/gltf-binary' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}.glb`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 /** Load the GLB via GLTFLoader then convert to USDZ with USDZExporter. */
@@ -44,9 +94,40 @@ async function downloadUsdz(modelUrl: string, baseName: string) {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
+/** Export the live Three.js scene and download as USDZ. */
+async function downloadUsdzFromScene(scene: THREE.Group, baseName: string) {
+    // Swap segment-color materials → original materials
+    const overrides: { mesh: THREE.Mesh; coloredMat: THREE.Material | THREE.Material[] }[] = [];
+    scene.traverse((child) => {
+        if (child instanceof THREE.Mesh && child.userData.__origMaterial) {
+            overrides.push({ mesh: child, coloredMat: child.material });
+            child.material = child.userData.__origMaterial;
+        }
+    });
+
+    const { USDZExporter } = await import('three/examples/jsm/exporters/USDZExporter.js');
+    const exporter = new USDZExporter();
+    const arraybuffer = await exporter.parseAsync(scene);
+
+    // Restore segment-color materials
+    for (const { mesh, coloredMat } of overrides) {
+        mesh.material = coloredMat;
+    }
+
+    const blob = new Blob([arraybuffer], { type: 'model/vnd.usdz+zip' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}.usdz`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
-export default function ExportDropdown({ className }: ExportDropdownProps) {
+export default function ExportDropdown({ className, sceneRef }: ExportDropdownProps) {
     const [open, setOpen] = useState(false);
     const [working, setWorking] = useState(false);
     const containerRef = useRef<HTMLDivElement>(null);
@@ -72,10 +153,19 @@ export default function ExportDropdown({ className }: ExportDropdownProps) {
         setWorking(true);
         setOpen(false);
         try {
+            const liveScene = sceneRef?.current;
             if (format === 'glb') {
-                downloadGlb(activeAsset.modelUrl, baseName);
+                if (liveScene) {
+                    await downloadGlbFromScene(liveScene, baseName);
+                } else {
+                    downloadGlb(activeAsset.modelUrl, baseName);
+                }
             } else {
-                await downloadUsdz(activeAsset.modelUrl, baseName);
+                if (liveScene) {
+                    await downloadUsdzFromScene(liveScene, baseName);
+                } else {
+                    await downloadUsdz(activeAsset.modelUrl, baseName);
+                }
             }
         } catch (err) {
             console.error(`[ExportDropdown] ${format} export failed:`, err);
