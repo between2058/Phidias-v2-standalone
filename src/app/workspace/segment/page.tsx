@@ -279,7 +279,11 @@ export default function SegmentPage() {
     const rebuildRef = useRef<(parts: Part[]) => void>(() => { });
 
     // ── View mode: 'original' shows native materials, 'colored' shows palette ──
-    const [viewMode, setViewMode] = useState<'original' | 'colored'>('original');
+    // Initialize from store: if parts already have colors (e.g. tab switch), start in 'colored'.
+    const [viewMode, setViewMode] = useState<'original' | 'colored'>(() => {
+        const stored = useSegmentStore.getState().parts;
+        return stored.some(p => p.color !== '') ? 'colored' : 'original';
+    });
 
     // Derive colors and meshId map from parts (replaces explicit setState calls)
     const segmentColors = useMemo(() => {
@@ -439,13 +443,38 @@ export default function SegmentPage() {
             pendingColorRef.current = false;
             setViewMode('colored');
         }
-        const newParts: Part[] = meshes.map((m, i) => ({
-            id: m.id,
-            name: m.name,
-            color: assignColors ? SEGMENT_PALETTE[i % SEGMENT_PALETTE.length] : '',
-            visible: m.visible,
-            meshIds: [m.id],
-        }));
+
+        // Preserve existing part colors/names on tab-switch remounts:
+        // if the store already has parts with matching IDs, carry over their
+        // color, name, and group structure instead of resetting to defaults.
+        const existing = useSegmentStore.getState().parts;
+        const existingMap = new Map(existing.map(p => [p.id, p]));
+
+        const newParts: Part[] = meshes.map((m, i) => {
+            const prev = existingMap.get(m.id);
+            return {
+                id: m.id,
+                name: prev?.name ?? m.name,
+                color: assignColors
+                    ? SEGMENT_PALETTE[i % SEGMENT_PALETTE.length]
+                    : (prev?.color ?? ''),
+                visible: m.visible,
+                meshIds: [m.id],
+                parentId: prev?.parentId,
+            };
+        });
+
+        // Re-insert group parts that still have children in the new mesh set
+        const meshIdSet = new Set(meshes.map(m => m.id));
+        for (const ep of existing) {
+            if (ep.isGroup && ep.childIds?.some(cid => meshIdSet.has(cid))) {
+                const insertAt = newParts.findIndex(p => ep.childIds?.includes(p.id));
+                if (insertAt >= 0 && !newParts.some(p => p.id === ep.id)) {
+                    newParts.splice(insertAt, 0, { ...ep });
+                }
+            }
+        }
+
         const temporal = useSegmentStore.temporal.getState();
         temporal.pause();
         setParts(newParts);

@@ -257,6 +257,10 @@ function GLBModel({
     }, [clonedScene, selectedObjectIds, highlightedMeshName, isSegmentMode, outlineRef, invalidate]);
 
     // Apply render mode, segment colors, and emissive highlight (model mode only).
+    // We store original materials so we can restore them when switching back
+    // from colored → original view mode.
+    const origMaterialsRef = useRef<Map<string, THREE.Material | THREE.Material[]>>(new Map());
+
     useEffect(() => {
         const isHighlighted = (child: THREE.Mesh) => {
             const oid = objectId(child);
@@ -266,16 +270,28 @@ function GLBModel({
 
         clonedScene.traverse((child) => {
             if (!(child instanceof THREE.Mesh)) return;
+            const oid = objectId(child);
 
             // Segment color override (flat material — Outline handles selection highlight)
-            const segColor = segmentColors && (segmentColors[objectId(child)] ?? segmentColors[child.name]);
+            const segColor = segmentColors && (segmentColors[oid] ?? segmentColors[child.name]);
             if (segColor) {
+                // Save original material before first override
+                if (!origMaterialsRef.current.has(oid)) {
+                    origMaterialsRef.current.set(oid, child.material);
+                }
                 child.material = new THREE.MeshStandardMaterial({
                     color: segColor,
                     roughness: 0.6,
                     metalness: 0.1,
                 });
                 return;
+            }
+
+            // Restore original material if we previously overrode it
+            const saved = origMaterialsRef.current.get(oid);
+            if (saved) {
+                child.material = saved;
+                origMaterialsRef.current.delete(oid);
             }
 
             // ── Model mode render modes (with emissive highlight) ──────────────────
