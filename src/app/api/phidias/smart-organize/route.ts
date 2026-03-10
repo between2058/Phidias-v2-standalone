@@ -345,7 +345,7 @@ async function callAnthropic(
         },
         body: JSON.stringify({
             model: VLM_MODEL,
-            max_tokens: 4096,
+            max_tokens: 16384,
             temperature: 0.2,
             system,
             messages: [
@@ -389,7 +389,7 @@ async function callOpenAICompat(
         },
         body: JSON.stringify({
             model: VLM_MODEL,
-            max_tokens: 4096,
+            max_tokens: 16384,
             temperature: 0.2,
             messages: [
                 { role: 'system', content: system },
@@ -412,9 +412,28 @@ async function callOpenAICompat(
     const data = await res.json();
     console.log(`[smart-organize] VLM response keys:`, JSON.stringify(Object.keys(data)));
     console.log(`[smart-organize] VLM choices[0]:`, JSON.stringify(data.choices?.[0], null, 2)?.slice(0, 500));
-    const content = data.choices?.[0]?.message?.content ?? '';
+
+    const choice = data.choices?.[0];
+    let content = choice?.message?.content ?? '';
+
+    // Reasoning models (e.g. kimi-k2.5) put chain-of-thought in `reasoning`
+    // and may leave `content` null if they run out of output tokens.
+    // Try to extract JSON from the reasoning field as a fallback.
     if (!content) {
-        console.warn(`[smart-organize] VLM returned empty content. Full response:`, JSON.stringify(data).slice(0, 1000));
+        const reasoning = choice?.reasoning ?? choice?.message?.reasoning_content ?? '';
+        if (reasoning) {
+            console.warn(`[smart-organize] content is null, attempting to extract JSON from reasoning field (${reasoning.length} chars)`);
+            try {
+                extractJson(reasoning);
+                // If extractJson succeeds, use reasoning as the content
+                content = reasoning;
+            } catch {
+                console.warn(`[smart-organize] no JSON found in reasoning field either`);
+            }
+        }
+        if (!content) {
+            console.warn(`[smart-organize] VLM returned empty content. Full response:`, JSON.stringify(data).slice(0, 1000));
+        }
     }
     return content;
 }
