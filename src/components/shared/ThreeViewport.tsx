@@ -37,7 +37,6 @@ import * as THREE from 'three';
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js';
 import { clone as cloneWithSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { TransformData } from '@/lib/api/types';
-import SciFiLoader from './SciFiLoader';
 import { parseSceneGraph, objectId, findObjectInScene } from '@/lib/scene';
 import type { HierarchyItem } from '@/components/shared/HierarchyPanel';
 
@@ -89,8 +88,12 @@ export interface ThreeViewportProps {
     hdrUrl?: string;
     /** Additional Three.js objects to render inside the scene */
     children?: React.ReactNode;
-    /** Show SciFi particle loader inside the viewport during AI generation */
+    /** Show progress overlay inside the viewport during AI generation */
     isGenerating?: boolean;
+    /** 0–100 progress percentage; omit for indeterminate */
+    generatingProgress?: number;
+    /** Label shown next to the progress bar (e.g. "Generating", "Segmenting") */
+    generatingLabel?: string;
     /** Called with the Three.js Group when a GLB model is first loaded */
     onSceneReady?: (group: THREE.Group) => void;
     /** Called with parsed HierarchyItem tree when a model loads */
@@ -156,13 +159,15 @@ function ViewportLoadingFallback() {
             className="flex flex-col items-center justify-center w-full h-full"
             style={{ background: '#1a1a2e' }}
         >
-            <div
-                className="w-8 h-8 border-2 border-t-transparent rounded-full animate-spin"
-                style={{ borderColor: '#f5a623', borderTopColor: 'transparent' }}
-            />
-            <p className="text-xs mt-3" style={{ color: '#64748b' }}>
-                Loading 3D scene…
+            <p className="text-[11px] mb-3 tracking-wide" style={{ color: '#64748b' }}>
+                Loading scene
             </p>
+            <div style={{ width: 120, height: 3, background: 'rgba(213,180,81,0.12)', borderRadius: 2, overflow: 'hidden' }}>
+                <div
+                    className="animate-progress-indeterminate"
+                    style={{ height: '100%', width: '40%', background: 'linear-gradient(90deg, transparent, #D5B451, transparent)', borderRadius: 2 }}
+                />
+            </div>
         </div>
     );
 }
@@ -772,7 +777,7 @@ function MainScene({
     onSceneStats,
     isFirstPerson = false,
     onExitFirstPerson,
-    isGenerating = false,
+    isGenerating: _isGenerating = false,
     onSceneReady,
     onSceneGraphChange,
     selectedObjectIds,
@@ -967,9 +972,6 @@ function MainScene({
                     />
                 </GizmoHelper>
             )}
-
-            {/* SciFi Loader — shown during AI generation */}
-            {isGenerating && <SciFiLoader />}
 
             {/* Extra scene children from parent */}
             {children}
@@ -1449,6 +1451,8 @@ export default function ThreeViewport({
     className = '',
     statsData,
     isGenerating = false,
+    generatingProgress,
+    generatingLabel = 'Generating',
     onSceneReady,
     onSceneGraphChange,
     selectedObjectIds,
@@ -1573,7 +1577,6 @@ export default function ThreeViewport({
                                 isFirstPerson={isFirstPerson}
                                 onExitFirstPerson={handleExitFirstPerson}
                                 onSceneStats={showStats && !statsData ? handleSceneStats : undefined}
-                                isGenerating={isGenerating}
                                 onSceneReady={onSceneReady}
                                 onSceneGraphChange={onSceneGraphChange}
                                 selectedObjectIds={selectedObjectIds}
@@ -1592,6 +1595,77 @@ export default function ThreeViewport({
             </ViewportErrorBoundary>
 
             {/* HTML Overlays (outside Canvas) */}
+
+            {/* Progress bar overlay — shown during AI generation */}
+            {isGenerating && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: '50%',
+                        left: '50%',
+                        transform: 'translate(-50%, -50%)',
+                        zIndex: 25,
+                        pointerEvents: 'none',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        gap: 8,
+                    }}
+                >
+                    {/* Label + percentage */}
+                    <div
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 8,
+                            fontSize: 11,
+                            fontWeight: 500,
+                            color: '#D5B451',
+                        }}
+                    >
+                        <span>{generatingLabel}</span>
+                        {generatingProgress != null && (
+                            <span style={{ fontFamily: 'monospace', color: 'rgba(213,180,81,0.7)' }}>
+                                {Math.round(generatingProgress)}%
+                            </span>
+                        )}
+                    </div>
+                    {/* Bar track */}
+                    <div
+                        style={{
+                            width: 160,
+                            height: 3,
+                            background: 'rgba(213,180,81,0.12)',
+                            borderRadius: 2,
+                            overflow: 'hidden',
+                        }}
+                    >
+                        {generatingProgress != null ? (
+                            /* Determinate bar */
+                            <div
+                                style={{
+                                    height: '100%',
+                                    width: `${Math.min(100, Math.max(0, generatingProgress))}%`,
+                                    background: 'linear-gradient(90deg, #D5B451, #f0d88a)',
+                                    borderRadius: 2,
+                                    transition: 'width 0.4s ease',
+                                }}
+                            />
+                        ) : (
+                            /* Indeterminate shimmer */
+                            <div
+                                className="animate-progress-indeterminate"
+                                style={{
+                                    height: '100%',
+                                    width: '40%',
+                                    background: 'linear-gradient(90deg, transparent, #D5B451, transparent)',
+                                    borderRadius: 2,
+                                }}
+                            />
+                        )}
+                    </div>
+                </div>
+            )}
 
             {/* SkinnedMesh warning banner */}
             {hasSkinnedMesh && (

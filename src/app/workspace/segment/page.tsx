@@ -22,10 +22,13 @@ const ThreeViewport = dynamic(() => import('@/components/shared/ThreeViewport'),
     ssr: false,
     loading: () => (
         <div className="w-full h-full flex items-center justify-center bg-[#1a1a2e]">
-            <div
-                className="w-8 h-8 border-2 border-t-transparent rounded-full animate-spin"
-                style={{ borderColor: '#f5a623', borderTopColor: 'transparent' }}
-            />
+            <div className="flex flex-col items-center">
+                <div className="relative w-10 h-10">
+                    <div className="absolute inset-0 rounded-full animate-spin" style={{ border: '2px solid transparent', borderTopColor: '#D5B451', borderRightColor: 'rgba(213,180,81,0.3)' }} />
+                    <div className="absolute inset-1.5 rounded-full animate-spin" style={{ border: '1.5px solid transparent', borderBottomColor: 'rgba(139,124,200,0.6)', animationDirection: 'reverse', animationDuration: '1.5s' }} />
+                </div>
+                <p className="text-[#64748b] text-[11px] mt-3 tracking-wide">Loading viewport</p>
+            </div>
         </div>
     ),
 });
@@ -1306,6 +1309,8 @@ export default function SegmentPage() {
                         onSceneGraphChange={handleSceneGraphChange}
                         segmentColors={segmentColors}
                         isGenerating={isSegmenting}
+                        generatingProgress={segmentProgress}
+                        generatingLabel="Segmenting"
                         onThumbnailReady={(dataUrl) => { if (activeAssetId) updateAssetThumbnail(activeAssetId, dataUrl); }}
                         onHasSkinnedMesh={(v) => { if (activeAssetId) updateAsset(activeAssetId, { hasSkinnedMesh: v }); }}
                         colorViewMode={!isSegmenting ? viewMode : undefined}
@@ -1313,21 +1318,6 @@ export default function SegmentPage() {
                         className="w-full h-full"
                     />
                 </Suspense>
-
-                {/* AI mode progress overlay on viewport */}
-                {isSegmenting && (
-                    <div
-                        className="absolute top-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-xs font-medium flex items-center gap-2 z-10"
-                        style={{
-                            background: 'rgba(13,13,24,0.92)',
-                            border: '1px solid #7c3aed',
-                            color: '#a78bfa',
-                        }}
-                    >
-                        <div className="w-3 h-3 rounded-full border-2 border-[#7c3aed] border-t-transparent animate-spin" />
-                        Running P3-SAM segmentation… {Math.round(segmentProgress)}%
-                    </div>
-                )}
 
                 {/* Bottom Toolbar */}
                 <div
