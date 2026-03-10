@@ -36,8 +36,8 @@ export default function LeftIconSidebar() {
 
     return (
         <aside
-            className="flex flex-col items-center bg-bg-darkest border-r border-phidias-border shrink-0 py-4 gap-1"
-            style={{ width: 56 }}
+            className="flex flex-col items-center bg-bg-darkest border-r shrink-0 py-4 gap-1"
+            style={{ width: 56, borderColor: '#333355' }}
         >
             {tabs.map((tab) => {
                 const isActive = pathname === tab.href || pathname?.startsWith(tab.href);

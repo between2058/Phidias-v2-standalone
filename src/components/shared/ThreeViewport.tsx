@@ -578,9 +578,10 @@ function StatsCollector({ modelUrl, onStats }: StatsCollectorProps) {
 // ─── Thumbnail Capture ────────────────────────────────────────────────────────
 
 /**
- * After the model URL changes, waits 600 ms for the scene to settle then
- * captures the WebGL canvas as a JPEG data-URL and fires onCapture.
- * Requires preserveDrawingBuffer: true on the parent Canvas.
+ * After the model URL changes, renders an offscreen thumbnail with:
+ * - A camera fitted to the model's bounding box
+ * - HDRI environment as both lighting and background
+ * - No UI gizmos or overlays
  */
 function ThumbnailCapture({
     modelUrl,
@@ -595,11 +596,135 @@ function ThumbnailCapture({
 
     useEffect(() => {
         if (!modelUrl) return;
-        const id = setTimeout(() => {
-            const dataUrl = gl.domElement.toDataURL('image/jpeg', 0.82);
+
+        let cancelled = false;
+
+        const capture = async () => {
+            // Load the HDR environment texture
+            const { RGBELoader } = await import('three/examples/jsm/loaders/RGBELoader.js');
+            const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
+
+            const rgbeLoader = new RGBELoader();
+            const gltfLoader = new GLTFLoader();
+
+            // Load model
+            const gltf = await new Promise<{ scene: THREE.Group }>((resolve, reject) => {
+                gltfLoader.load(modelUrl!, resolve, undefined, reject);
+            });
+            if (cancelled) return;
+
+            // Load HDR
+            const hdrTexture = await new Promise<THREE.DataTexture>((resolve, reject) => {
+                rgbeLoader.load(DEFAULT_HDR, resolve, undefined, reject);
+            });
+            if (cancelled) return;
+
+            hdrTexture.mapping = THREE.EquirectangularReflectionMapping;
+
+            // Build offscreen scene
+            const thumbScene = new THREE.Scene();
+            thumbScene.environment = hdrTexture;
+            thumbScene.background = hdrTexture;
+            // Boost env lighting on model (Three.js r155+)
+            if ('environmentIntensity' in thumbScene) {
+                (thumbScene as any).environmentIntensity = 2.0;
+            }
+
+            // Add model first so bounding box is correct
+            thumbScene.add(gltf.scene);
+
+            // Compute bounding box and fit camera
+            const box = new THREE.Box3().setFromObject(gltf.scene);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = 40;
+            const dist = (maxDim / 2) / Math.tan((fov * Math.PI) / 360) * 1.3;
+
+            const thumbCam = new THREE.PerspectiveCamera(fov, 1, 0.01, dist * 10);
+            // Position camera at ~15° elevation, ~30° azimuth for a subtle 3/4 view
+            const azimuth = (30 * Math.PI) / 180;
+            const elevation = (15 * Math.PI) / 180;
+            thumbCam.position.set(
+                center.x + dist * Math.cos(elevation) * Math.sin(azimuth),
+                center.y + dist * Math.sin(elevation),
+                center.z + dist * Math.cos(elevation) * Math.cos(azimuth),
+            );
+            thumbCam.lookAt(center);
+            thumbCam.updateProjectionMatrix();
+
+            // Lights — key light from camera, pointing at model center
+            const ambient = new THREE.AmbientLight(0xffffff, 0.8);
+
+            const keyTarget = new THREE.Object3D();
+            keyTarget.position.copy(center);
+            thumbScene.add(keyTarget);
+
+            const keyLight = new THREE.DirectionalLight(0xffffff, 1.5);
+            keyLight.position.copy(thumbCam.position);
+            keyLight.target = keyTarget;
+            thumbScene.add(keyLight);
+
+            // Fill from opposite side
+            const fillLight = new THREE.DirectionalLight(0xffffff, 0.6);
+            fillLight.position.set(
+                center.x - (thumbCam.position.x - center.x),
+                center.y + dist * 0.3,
+                center.z - (thumbCam.position.z - center.z),
+            );
+            fillLight.target = keyTarget;
+            thumbScene.add(fillLight);
+
+            // Render to offscreen target
+            const thumbSize = 512;
+            const rt = new THREE.WebGLRenderTarget(thumbSize, thumbSize, {
+                format: THREE.RGBAFormat,
+                type: THREE.UnsignedByteType,
+            });
+
+            const prevRT = gl.getRenderTarget();
+            const prevToneMapping = gl.toneMapping;
+            const prevExposure = gl.toneMappingExposure;
+            gl.toneMapping = THREE.ACESFilmicToneMapping;
+            gl.toneMappingExposure = 1.6;
+
+            gl.setRenderTarget(rt);
+            gl.clear();
+            gl.render(thumbScene, thumbCam);
+            gl.setRenderTarget(prevRT);
+            gl.toneMapping = prevToneMapping;
+            gl.toneMappingExposure = prevExposure;
+
+            // Read pixels to canvas
+            const pixels = new Uint8Array(thumbSize * thumbSize * 4);
+            gl.readRenderTargetPixels(rt, 0, 0, thumbSize, thumbSize, pixels);
+
+            const canvas = document.createElement('canvas');
+            canvas.width = thumbSize;
+            canvas.height = thumbSize;
+            const ctx = canvas.getContext('2d')!;
+            const imgData = ctx.createImageData(thumbSize, thumbSize);
+
+            // Flip Y (WebGL reads bottom-up)
+            for (let y = 0; y < thumbSize; y++) {
+                const srcRow = (thumbSize - 1 - y) * thumbSize * 4;
+                const dstRow = y * thumbSize * 4;
+                for (let x = 0; x < thumbSize * 4; x++) {
+                    imgData.data[dstRow + x] = pixels[srcRow + x];
+                }
+            }
+            ctx.putImageData(imgData, 0, 0);
+
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
             callbackRef.current(dataUrl);
-        }, 650);
-        return () => clearTimeout(id);
+
+            // Cleanup
+            rt.dispose();
+            hdrTexture.dispose();
+        };
+
+        const id = setTimeout(capture, 400);
+        return () => { cancelled = true; clearTimeout(id); };
     }, [modelUrl, gl]);
 
     return null;
