@@ -142,15 +142,24 @@ export async function POST(request: NextRequest) {
             '- Return ONLY the JSON array',
         ].join('\n');
 
+        console.log(`[smart-organize] VLM config — URL: ${VLM_API_URL}, model: ${VLM_MODEL}, isAnthropic: ${isAnthropic()}`);
+        console.log(`[smart-organize] Input — ${parts.length} parts, ${originalImages.length} original imgs, ${coloredImages.length} colored imgs, angles: [${angleLabels.join(', ')}]`);
+        console.log(`[smart-organize] Image sizes — original: [${originalImages.map(i => `${(i.base64.length / 1024).toFixed(0)}KB`).join(', ')}], colored: [${coloredImages.map(i => `${(i.base64.length / 1024).toFixed(0)}KB`).join(', ')}]`);
+
         // Try up to 2 times
         let lastError: Error | null = null;
         for (let attempt = 0; attempt < 2; attempt++) {
             try {
+                console.log(`[smart-organize] attempt ${attempt + 1} — calling VLM...`);
                 const raw = isAnthropic()
                     ? await callAnthropic(originalImages, coloredImages, angleLabels, system, user)
                     : await callOpenAICompat(originalImages, coloredImages, angleLabels, system, user);
 
+                console.log(`[smart-organize] attempt ${attempt + 1} — raw response (${raw.length} chars):`);
+                console.log(`[smart-organize] >>>START>>>\n${raw}\n<<<END<<<`);
+
                 const result = extractAndValidate(raw, parts);
+                console.log(`[smart-organize] SUCCESS — ${result.length} parts returned`);
                 return NextResponse.json({ parts: result });
             } catch (err: any) {
                 lastError = err;
@@ -215,13 +224,20 @@ function extractAndValidate(
 
 function extractJson(text: string): any[] {
     const trimmed = text.trim();
+    console.log(`[smart-organize:extractJson] input length: ${trimmed.length}, starts with: "${trimmed.slice(0, 80)}..."`);
+
     if (trimmed.startsWith('[')) {
-        try { return JSON.parse(trimmed); } catch { /* fall through */ }
+        try { return JSON.parse(trimmed); } catch (e: any) {
+            console.warn(`[smart-organize:extractJson] direct parse failed:`, e.message);
+        }
     }
 
     const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (fenceMatch) {
-        try { return JSON.parse(fenceMatch[1].trim()); } catch { /* fall through */ }
+        console.log(`[smart-organize:extractJson] found fenced block (${fenceMatch[1].trim().length} chars)`);
+        try { return JSON.parse(fenceMatch[1].trim()); } catch (e: any) {
+            console.warn(`[smart-organize:extractJson] fence parse failed:`, e.message);
+        }
     }
 
     let depth = 0, start = -1;
@@ -230,11 +246,15 @@ function extractJson(text: string): any[] {
         else if (trimmed[i] === ']') {
             depth--;
             if (depth === 0 && start >= 0) {
-                try { return JSON.parse(trimmed.slice(start, i + 1)); } catch { /* continue */ }
+                const candidate = trimmed.slice(start, i + 1);
+                try { return JSON.parse(candidate); } catch (e: any) {
+                    console.warn(`[smart-organize:extractJson] bracket extraction failed at [${start}:${i + 1}]:`, e.message);
+                }
             }
         }
     }
 
+    console.error(`[smart-organize:extractJson] ALL extraction methods failed. Full text:\n${trimmed}`);
     throw new Error('No valid JSON array found in VLM response');
 }
 
@@ -384,7 +404,17 @@ async function callOpenAICompat(
         }),
     });
 
-    if (!res.ok) throw new Error(`VLM API ${res.status}: ${await res.text()}`);
+    if (!res.ok) {
+        const errBody = await res.text();
+        console.error(`[smart-organize] VLM API error ${res.status}:`, errBody);
+        throw new Error(`VLM API ${res.status}: ${errBody}`);
+    }
     const data = await res.json();
-    return data.choices?.[0]?.message?.content ?? '';
+    console.log(`[smart-organize] VLM response keys:`, JSON.stringify(Object.keys(data)));
+    console.log(`[smart-organize] VLM choices[0]:`, JSON.stringify(data.choices?.[0], null, 2)?.slice(0, 500));
+    const content = data.choices?.[0]?.message?.content ?? '';
+    if (!content) {
+        console.warn(`[smart-organize] VLM returned empty content. Full response:`, JSON.stringify(data).slice(0, 1000));
+    }
+    return content;
 }
