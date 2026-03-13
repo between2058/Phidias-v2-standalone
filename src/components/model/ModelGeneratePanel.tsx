@@ -183,10 +183,13 @@ export default function ModelGeneratePanel({ onGenerate, isGenerating, progress,
     const [shapSlat, setShapSlat] = useState<GenerationParams>(DEFAULT_SHAPSLAT);
 
     // ── Validation ──────────────────────────────────────────────────────────
-    const canGenerate =
-        !isGenerating &&
-        (inputMode === 'text' ? prompt.trim().length > 0 :
-            inputMode === 'batch' ? batchFiles.length > 0 : true);
+    const hasInput =
+        inputMode === 'image' ? !!imageFile :
+        inputMode === 'multiview' ? multiViewFiles.length > 0 :
+        inputMode === 'text' ? prompt.trim().length > 0 :
+        inputMode === 'batch' ? batchFiles.length > 0 : false;
+
+    const canGenerate = !isGenerating && hasInput;
 
     // ── Assemble and emit ────────────────────────────────────────────────────
     const handleGenerate = () => {
@@ -456,9 +459,10 @@ export default function ModelGeneratePanel({ onGenerate, isGenerating, progress,
             <div className="p-4 border-t border-[#333355]">
                 <button
                     onClick={handleGenerate}
-                    disabled={!canGenerate && !isGenerating}
-                    className={cn('w-full py-3 rounded-xl text-sm font-bold text-[#1a1a2e] transition-opacity hover:opacity-90 btn-gradient',
-                        isGenerating ? 'generating' : '')}
+                    disabled={!canGenerate}
+                    className={cn('w-full py-3 rounded-xl text-sm font-bold text-[#1a1a2e] transition-all btn-gradient',
+                        isGenerating ? 'generating' : '',
+                        !canGenerate && !isGenerating ? 'opacity-40 cursor-not-allowed' : 'hover:opacity-90')}
                 >
                     <span className="gradient-bg bg1" aria-hidden />
                     <span className={'gradient-bg bg2' + (isGenerating ? ' animate' : '')} aria-hidden />

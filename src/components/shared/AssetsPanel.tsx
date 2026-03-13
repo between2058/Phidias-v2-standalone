@@ -767,7 +767,7 @@ function HistoryTab() {
 
 // ─── Main Panel ───────────────────────────────────────────────────────────────
 
-export default function AssetsPanel() {
+export default function AssetsPanel({ defaultTab = 'assets' }: { defaultTab?: PanelTab }) {
     const {
         assets,
         activeAssetId,
@@ -780,7 +780,7 @@ export default function AssetsPanel() {
         segmentHierarchy,
     } = useWorkspace();
 
-    const [panelTab, setPanelTab] = useState<PanelTab>('assets');
+    const [panelTab, setPanelTab] = useState<PanelTab>(defaultTab);
     const [viewMode, setViewMode] = useState<ViewMode>('grid');
     const [activeFilter, setActiveFilter] = useState<ActiveFilter>('all');
     const [modelTypeFilter, setModelTypeFilter] = useState<ModelTypeFilter>('all');
@@ -859,6 +859,21 @@ export default function AssetsPanel() {
         setIsManageMode(false);
         setSelectedIds(new Set());
         setShowManageDropdown(false);
+    };
+
+    const handleBatchExport = () => {
+        if (selectedIds.size === 0) return;
+        const selected = assets.filter(a => selectedIds.has(a.id) && a.modelUrl && a.status === 'ready');
+        if (selected.length === 0) return;
+        for (const asset of selected) {
+            const a = document.createElement('a');
+            a.href = asset.modelUrl!;
+            a.download = `${asset.name.replace(/\.[^/.]+$/, '')}.glb`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        }
+        exitManageMode();
     };
 
     const handleBatchDelete = () => {
@@ -1186,8 +1201,9 @@ export default function AssetsPanel() {
                                     All
                                 </button>
                                 <button
-                                    onClick={() => exitManageMode()}
-                                    className="flex items-center gap-1 px-2 py-1 rounded text-xs text-[#94a3b8] hover:bg-[#2a2a4a] transition-colors"
+                                    onClick={handleBatchExport}
+                                    disabled={selectedIds.size === 0}
+                                    className="flex items-center gap-1 px-2 py-1 rounded text-xs text-[#94a3b8] hover:bg-[#2a2a4a] transition-colors disabled:opacity-40"
                                 >
                                     <Download size={10} />
                                 </button>

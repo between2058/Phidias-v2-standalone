@@ -145,3 +145,39 @@
     display: none;
   }
 }
+
+@keyframes glow-sweep {
+  0% {
+    background-position: -100% center;
+  }
+  100% {
+    background-position: 200% center;
+  }
+}
+
+.animate-glow-pulse {
+  color: #D5B451;
+  background: linear-gradient(
+    90deg,
+    #D5B451 0%,
+    #D5B451 35%,
+    #fff8dc 50%,
+    #D5B451 65%,
+    #D5B451 100%
+  );
+  background-size: 200% 100%;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  text-shadow: none;
+  animation: glow-sweep 3s ease-in-out infinite;
+}
+
+@keyframes progress-indeterminate {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+
+.animate-progress-indeterminate {
+  animation: progress-indeterminate 1.5s ease-in-out infinite;
+}

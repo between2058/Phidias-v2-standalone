@@ -13,7 +13,6 @@ export interface P3SAMParams {
     prompt_bs: number;
     post_process: boolean;
     clean_mesh_flag: boolean;
-    save_mid_res: boolean;
     seed: number;
     randomize_seed: boolean;
 }
@@ -36,7 +35,6 @@ const DEFAULT_PARAMS: P3SAMParams = {
     prompt_bs: 32,
     post_process: true,
     clean_mesh_flag: true,
-    save_mid_res: false,
     seed: 42,
     randomize_seed: false,
 };
@@ -48,7 +46,6 @@ const PARAM_DESCRIPTIONS: Record<string, string> = {
     prompt_bs: 'GPU inference batch size (prompt_bs). Reduce if you get out-of-memory errors.',
     post_process: 'AABB-based region merging and gap filling after mask prediction (post_process).',
     clean_mesh_flag: 'Remove degenerate faces and merge near-duplicate vertices before processing (clean_mesh_flag).',
-    save_mid_res: 'Persist intermediate meshes (point cloud, clusters, AABB views) to the output directory (save_mid_res).',
     seed: 'RNG seed for reproducibility. Use the dice button to randomize.',
     multimask_output: 'Return three mask candidates per prompt ranked by confidence — lets you pick the best one.',
     use_previous_mask: 'Use the previous segmentation result as a warm start for the next prediction.',
@@ -211,6 +208,8 @@ interface SegmentAIPanelProps {
     results: SegmentResult[];
     onStart: (params: P3SAMParams) => void;
     onCancel: () => void;
+    onSmartOrganize?: () => void;
+    isOrganizing?: boolean;
 }
 
 type SectionKey = 'sampling' | 'detection' | 'postprocess' | 'advanced';
@@ -223,6 +222,8 @@ export default function SegmentAIPanel({
     results,
     onStart,
     onCancel,
+    onSmartOrganize,
+    isOrganizing,
 }: SegmentAIPanelProps) {
     const [params, setParams] = useState<P3SAMParams>(DEFAULT_PARAMS);
     const [openSections, setOpenSections] = useState<Record<SectionKey, boolean>>({
@@ -369,12 +370,6 @@ export default function SegmentAIPanel({
                                     value={params.clean_mesh_flag}
                                     onChange={v => setParam('clean_mesh_flag', v)}
                                 />
-                                <ToggleRow
-                                    label="Save Intermediates"
-                                    paramKey="save_mid_res"
-                                    value={params.save_mid_res}
-                                    onChange={v => setParam('save_mid_res', v)}
-                                />
                             </div>
                         )}
                     </div>
@@ -487,35 +482,45 @@ export default function SegmentAIPanel({
                 )}
             </div>
 
-            {/* ── Results ──────────────────────────────────────────────────────────── */}
-            {
-                results.length > 0 && !isSegmenting && (
-                    <div
-                        className="flex-shrink-0 border-t"
-                        style={{ borderColor: '#333355', maxHeight: 200 }}
+            {/* Results section removed — part list is shown in the scene graph panel */}
+
+            {/* ── Smart Organize ─────────────────────────────────────────────── */}
+            {results.length > 0 && !isSegmenting && onSmartOrganize && (
+                <div
+                    className="flex-shrink-0 p-3 border-t"
+                    style={{ borderColor: '#333355' }}
+                >
+                    <button
+                        onClick={onSmartOrganize}
+                        disabled={isOrganizing}
+                        className={cn(
+                            'w-full py-2.5 rounded-xl text-sm font-bold transition-opacity hover:opacity-90',
+                            isOrganizing ? 'cursor-not-allowed opacity-60' : 'cursor-pointer',
+                        )}
+                        style={{
+                            background: isOrganizing
+                                ? '#252542'
+                                : 'linear-gradient(135deg, #7c3aed, #D5B451)',
+                            color: isOrganizing ? '#64748b' : '#fff',
+                        }}
                     >
-                        <div
-                            className="px-3 py-2 flex items-center justify-between border-b"
-                            style={{ borderColor: '#333355' }}
-                        >
-                            <span className="text-xs font-semibold" style={{ color: '#94a3b8' }}>
-                                {results.length} parts detected
+                        {isOrganizing ? (
+                            <span className="flex items-center justify-center gap-2">
+                                <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                                Organizing...
                             </span>
-                            <span
-                                className="text-[9px] px-1.5 py-0.5 rounded-full"
-                                style={{ background: '#22c55e22', color: '#22c55e' }}
-                            >
-                                ✓ Applied
-                            </span>
-                        </div>
-                        <div className="overflow-y-auto scrollbar-thin" style={{ maxHeight: 148 }}>
-                            {results.map(r => (
-                                <ResultRow key={r.id} result={r} />
-                            ))}
-                        </div>
-                    </div>
-                )
-            }
+                        ) : (
+                            'Smart Organize'
+                        )}
+                    </button>
+                    <p
+                        className="text-center text-[9px] mt-1.5"
+                        style={{ color: '#4b5563' }}
+                    >
+                        Uses VLM to auto-name parts &amp; create groups
+                    </p>
+                </div>
+            )}
         </div >
     );
 }

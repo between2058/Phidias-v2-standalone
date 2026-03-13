@@ -37,7 +37,6 @@ import * as THREE from 'three';
 import { PLYLoader } from 'three/examples/jsm/loaders/PLYLoader.js';
 import { clone as cloneWithSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js';
 import { TransformData } from '@/lib/api/types';
-import SciFiLoader from './SciFiLoader';
 import { parseSceneGraph, objectId, findObjectInScene } from '@/lib/scene';
 import type { HierarchyItem } from '@/components/shared/HierarchyPanel';
 
@@ -89,8 +88,12 @@ export interface ThreeViewportProps {
     hdrUrl?: string;
     /** Additional Three.js objects to render inside the scene */
     children?: React.ReactNode;
-    /** Show SciFi particle loader inside the viewport during AI generation */
+    /** Show progress overlay inside the viewport during AI generation */
     isGenerating?: boolean;
+    /** 0–100 progress percentage; omit for indeterminate */
+    generatingProgress?: number;
+    /** Label shown next to the progress bar (e.g. "Generating", "Segmenting") */
+    generatingLabel?: string;
     /** Called with the Three.js Group when a GLB model is first loaded */
     onSceneReady?: (group: THREE.Group) => void;
     /** Called with parsed HierarchyItem tree when a model loads */
@@ -103,6 +106,10 @@ export interface ThreeViewportProps {
     onThumbnailReady?: (dataUrl: string) => void;
     /** Called after the model loads, true if any SkinnedMesh was found */
     onHasSkinnedMesh?: (value: boolean) => void;
+    /** Current color view mode (original vs colored) — shown in right toolbar when provided */
+    colorViewMode?: 'original' | 'colored';
+    /** Called when the user toggles the color view mode */
+    onColorViewModeChange?: (mode: 'original' | 'colored') => void;
 }
 
 // ─── Error Boundary ────────────────────────────────────────────────────────────
@@ -152,13 +159,15 @@ function ViewportLoadingFallback() {
             className="flex flex-col items-center justify-center w-full h-full"
             style={{ background: '#1a1a2e' }}
         >
-            <div
-                className="w-8 h-8 border-2 border-t-transparent rounded-full animate-spin"
-                style={{ borderColor: '#f5a623', borderTopColor: 'transparent' }}
-            />
-            <p className="text-xs mt-3" style={{ color: '#64748b' }}>
-                Loading 3D scene…
+            <p className="text-[11px] mb-3 tracking-wide" style={{ color: '#64748b' }}>
+                Loading scene
             </p>
+            <div style={{ width: 120, height: 3, background: 'rgba(213,180,81,0.12)', borderRadius: 2, overflow: 'hidden' }}>
+                <div
+                    className="animate-progress-indeterminate"
+                    style={{ height: '100%', width: '40%', background: 'linear-gradient(90deg, transparent, #D5B451, transparent)', borderRadius: 2 }}
+                />
+            </div>
         </div>
     );
 }
@@ -257,6 +266,10 @@ function GLBModel({
     }, [clonedScene, selectedObjectIds, highlightedMeshName, isSegmentMode, outlineRef, invalidate]);
 
     // Apply render mode, segment colors, and emissive highlight (model mode only).
+    // We store original materials so we can restore them when switching back
+    // from colored → original view mode.
+    const origMaterialsRef = useRef<Map<string, THREE.Material | THREE.Material[]>>(new Map());
+
     useEffect(() => {
         const isHighlighted = (child: THREE.Mesh) => {
             const oid = objectId(child);
@@ -266,16 +279,34 @@ function GLBModel({
 
         clonedScene.traverse((child) => {
             if (!(child instanceof THREE.Mesh)) return;
+            const oid = objectId(child);
 
-            // Segment color override (flat material — Outline handles selection highlight)
-            const segColor = segmentColors && (segmentColors[objectId(child)] ?? segmentColors[child.name]);
+            // Segment color override with selection highlight
+            const segColor = segmentColors && (segmentColors[oid] ?? segmentColors[child.name]);
             if (segColor) {
+                // Save original material before first override
+                if (!origMaterialsRef.current.has(oid)) {
+                    origMaterialsRef.current.set(oid, child.material);
+                }
+                // Also stash on the mesh itself so external code (e.g. export)
+                // can restore original materials without accessing this ref.
+                child.userData.__origMaterial = origMaterialsRef.current.get(oid);
+                const highlighted = isHighlighted(child);
                 child.material = new THREE.MeshStandardMaterial({
                     color: segColor,
                     roughness: 0.6,
                     metalness: 0.1,
+                    emissive: highlighted ? new THREE.Color(segColor) : new THREE.Color(0),
+                    emissiveIntensity: highlighted ? 0.4 : 0,
                 });
                 return;
+            }
+
+            // Restore original material if we previously overrode it
+            const saved = origMaterialsRef.current.get(oid);
+            if (saved) {
+                child.material = saved;
+                origMaterialsRef.current.delete(oid);
             }
 
             // ── Model mode render modes (with emissive highlight) ──────────────────
@@ -401,23 +432,32 @@ function PLYPointCloud({ url }: { url: string }) {
 
 // ─── Scene Lighting ───────────────────────────────────────────────────────────
 
-function SceneLighting({ hdrUrl }: { hdrUrl?: string }) {
+const DEFAULT_HDR = '/hdri/qwantani_moon_noon_puresky_4k.hdr';
+
+function SceneLighting({ hdrUrl, envIntensity = 1.2, envRotation = 0 }: {
+    hdrUrl?: string;
+    envIntensity?: number;
+    envRotation?: number;
+}) {
+    const envFile = hdrUrl || DEFAULT_HDR;
+    const rotY = (envRotation * Math.PI) / 180; // degrees → radians
     return (
         <>
-            <ambientLight intensity={0.4} />
+            <ambientLight intensity={0.15} />
             <directionalLight
                 position={[5, 10, 5]}
-                intensity={1.0}
+                intensity={0.4}
                 castShadow
                 shadow-mapSize-width={1024}
                 shadow-mapSize-height={1024}
             />
-            <directionalLight position={[-5, 5, -5]} intensity={0.3} />
-            {hdrUrl ? (
-                <Environment files={hdrUrl} background={false} />
-            ) : (
-                <Environment preset="city" background={false} />
-            )}
+            <directionalLight position={[-5, 5, -5]} intensity={0.15} />
+            <Environment
+                files={envFile}
+                background={false}
+                environmentIntensity={envIntensity}
+                environmentRotation={[0, rotY, 0]}
+            />
         </>
     );
 }
@@ -550,9 +590,10 @@ function StatsCollector({ modelUrl, onStats }: StatsCollectorProps) {
 // ─── Thumbnail Capture ────────────────────────────────────────────────────────
 
 /**
- * After the model URL changes, waits 600 ms for the scene to settle then
- * captures the WebGL canvas as a JPEG data-URL and fires onCapture.
- * Requires preserveDrawingBuffer: true on the parent Canvas.
+ * After the model URL changes, renders an offscreen thumbnail with:
+ * - A camera fitted to the model's bounding box
+ * - HDRI environment as both lighting and background
+ * - No UI gizmos or overlays
  */
 function ThumbnailCapture({
     modelUrl,
@@ -567,11 +608,135 @@ function ThumbnailCapture({
 
     useEffect(() => {
         if (!modelUrl) return;
-        const id = setTimeout(() => {
-            const dataUrl = gl.domElement.toDataURL('image/jpeg', 0.82);
+
+        let cancelled = false;
+
+        const capture = async () => {
+            // Load the HDR environment texture
+            const { RGBELoader } = await import('three/examples/jsm/loaders/RGBELoader.js');
+            const { GLTFLoader } = await import('three/examples/jsm/loaders/GLTFLoader.js');
+
+            const rgbeLoader = new RGBELoader();
+            const gltfLoader = new GLTFLoader();
+
+            // Load model
+            const gltf = await new Promise<{ scene: THREE.Group }>((resolve, reject) => {
+                gltfLoader.load(modelUrl!, resolve, undefined, reject);
+            });
+            if (cancelled) return;
+
+            // Load HDR
+            const hdrTexture = await new Promise<THREE.DataTexture>((resolve, reject) => {
+                rgbeLoader.load(DEFAULT_HDR, resolve, undefined, reject);
+            });
+            if (cancelled) return;
+
+            hdrTexture.mapping = THREE.EquirectangularReflectionMapping;
+
+            // Build offscreen scene
+            const thumbScene = new THREE.Scene();
+            thumbScene.environment = hdrTexture;
+            thumbScene.background = hdrTexture;
+            // Boost env lighting on model (Three.js r155+)
+            if ('environmentIntensity' in thumbScene) {
+                (thumbScene as any).environmentIntensity = 2.0;
+            }
+
+            // Add model first so bounding box is correct
+            thumbScene.add(gltf.scene);
+
+            // Compute bounding box and fit camera
+            const box = new THREE.Box3().setFromObject(gltf.scene);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = 40;
+            const dist = (maxDim / 2) / Math.tan((fov * Math.PI) / 360) * 1.3;
+
+            const thumbCam = new THREE.PerspectiveCamera(fov, 1, 0.01, dist * 10);
+            // Position camera at ~15° elevation, ~30° azimuth for a subtle 3/4 view
+            const azimuth = (30 * Math.PI) / 180;
+            const elevation = (15 * Math.PI) / 180;
+            thumbCam.position.set(
+                center.x + dist * Math.cos(elevation) * Math.sin(azimuth),
+                center.y + dist * Math.sin(elevation),
+                center.z + dist * Math.cos(elevation) * Math.cos(azimuth),
+            );
+            thumbCam.lookAt(center);
+            thumbCam.updateProjectionMatrix();
+
+            // Lights — key light from camera, pointing at model center
+            const ambient = new THREE.AmbientLight(0xffffff, 0.8);
+
+            const keyTarget = new THREE.Object3D();
+            keyTarget.position.copy(center);
+            thumbScene.add(keyTarget);
+
+            const keyLight = new THREE.DirectionalLight(0xffffff, 1.5);
+            keyLight.position.copy(thumbCam.position);
+            keyLight.target = keyTarget;
+            thumbScene.add(keyLight);
+
+            // Fill from opposite side
+            const fillLight = new THREE.DirectionalLight(0xffffff, 0.6);
+            fillLight.position.set(
+                center.x - (thumbCam.position.x - center.x),
+                center.y + dist * 0.3,
+                center.z - (thumbCam.position.z - center.z),
+            );
+            fillLight.target = keyTarget;
+            thumbScene.add(fillLight);
+
+            // Render to offscreen target
+            const thumbSize = 512;
+            const rt = new THREE.WebGLRenderTarget(thumbSize, thumbSize, {
+                format: THREE.RGBAFormat,
+                type: THREE.UnsignedByteType,
+            });
+
+            const prevRT = gl.getRenderTarget();
+            const prevToneMapping = gl.toneMapping;
+            const prevExposure = gl.toneMappingExposure;
+            gl.toneMapping = THREE.ACESFilmicToneMapping;
+            gl.toneMappingExposure = 1.6;
+
+            gl.setRenderTarget(rt);
+            gl.clear();
+            gl.render(thumbScene, thumbCam);
+            gl.setRenderTarget(prevRT);
+            gl.toneMapping = prevToneMapping;
+            gl.toneMappingExposure = prevExposure;
+
+            // Read pixels to canvas
+            const pixels = new Uint8Array(thumbSize * thumbSize * 4);
+            gl.readRenderTargetPixels(rt, 0, 0, thumbSize, thumbSize, pixels);
+
+            const canvas = document.createElement('canvas');
+            canvas.width = thumbSize;
+            canvas.height = thumbSize;
+            const ctx = canvas.getContext('2d')!;
+            const imgData = ctx.createImageData(thumbSize, thumbSize);
+
+            // Flip Y (WebGL reads bottom-up)
+            for (let y = 0; y < thumbSize; y++) {
+                const srcRow = (thumbSize - 1 - y) * thumbSize * 4;
+                const dstRow = y * thumbSize * 4;
+                for (let x = 0; x < thumbSize * 4; x++) {
+                    imgData.data[dstRow + x] = pixels[srcRow + x];
+                }
+            }
+            ctx.putImageData(imgData, 0, 0);
+
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
             callbackRef.current(dataUrl);
-        }, 650);
-        return () => clearTimeout(id);
+
+            // Cleanup
+            rt.dispose();
+            hdrTexture.dispose();
+        };
+
+        const id = setTimeout(capture, 400);
+        return () => { cancelled = true; clearTimeout(id); };
     }, [modelUrl, gl]);
 
     return null;
@@ -587,12 +752,16 @@ interface MainSceneProps
     onSceneStats?: (stats: { faces: number; vertices: number }) => void;
     isFirstPerson?: boolean;
     onExitFirstPerson?: () => void;
+    /** Snap model bottom to y=0 grid plane */
+    grounded?: boolean;
+    envIntensity?: number;
+    envRotation?: number;
 }
 
 function MainScene({
     modelUrl,
     pointCloudUrl,
-    showGrid = true,
+    showGrid = false,
     showAxes = true,
     transformMode = null,
     renderMode = 'textured',
@@ -608,13 +777,16 @@ function MainScene({
     onSceneStats,
     isFirstPerson = false,
     onExitFirstPerson,
-    isGenerating = false,
+    isGenerating: _isGenerating = false,
     onSceneReady,
     onSceneGraphChange,
     selectedObjectIds,
     onObjectMultiSelect,
     onThumbnailReady,
     onHasSkinnedMesh: onHasSkinnedMeshProp,
+    grounded = false,
+    envIntensity,
+    envRotation,
 }: MainSceneProps) {
     const modelGroupRef = useRef<THREE.Group>(null);
     const [selectedObject, setSelectedObject] = useState<THREE.Object3D | null>(null);
@@ -672,10 +844,26 @@ function MainScene({
 
     const isSelected = Boolean(selectedObjectId);
 
+    // Ground the model: shift the group so the bounding box bottom sits at y=0
+    const groundOffsetRef = useRef(0);
+    useEffect(() => {
+        const group = modelGroupRef.current;
+        if (!group) return;
+        // Undo previous offset first
+        group.position.y -= groundOffsetRef.current;
+        groundOffsetRef.current = 0;
+        if (!grounded) return;
+        const box = new THREE.Box3().setFromObject(group);
+        if (box.isEmpty()) return;
+        const offset = -box.min.y;
+        group.position.y += offset;
+        groundOffsetRef.current = offset;
+    }, [grounded, modelUrl]);
+
     return (
         <>
             <PerspectiveCamera makeDefault fov={45} near={0.1} far={1000} position={[0, 2, 5]} />
-            <SceneLighting hdrUrl={hdrUrl} />
+            <SceneLighting hdrUrl={hdrUrl} envIntensity={envIntensity} envRotation={envRotation} />
 
             {/* Grid */}
             {showGrid && (
@@ -784,9 +972,6 @@ function MainScene({
                     />
                 </GizmoHelper>
             )}
-
-            {/* SciFi Loader — shown during AI generation */}
-            {isGenerating && <SciFiLoader />}
 
             {/* Extra scene children from parent */}
             {children}
@@ -941,6 +1126,202 @@ function FirstPersonHint({ onExit }: { onExit: () => void }) {
     );
 }
 
+// ─── Viewport Settings Toolbar (right-side) ──────────────────────────────────
+
+function ViewportSettingsToolbar({
+    gridVisible, onToggleGrid,
+    grounded, onToggleGround,
+    envIntensity, onEnvIntensityChange,
+    envRotation, onEnvRotationChange,
+    colorViewMode, onColorViewModeChange,
+}: {
+    gridVisible: boolean; onToggleGrid: () => void;
+    grounded: boolean; onToggleGround: () => void;
+    envIntensity: number; onEnvIntensityChange: (v: number) => void;
+    envRotation: number; onEnvRotationChange: (v: number) => void;
+    colorViewMode?: 'original' | 'colored';
+    onColorViewModeChange?: (mode: 'original' | 'colored') => void;
+}) {
+    const [envOpen, setEnvOpen] = useState(false);
+    const panelRef = useRef<HTMLDivElement>(null);
+
+    // Close popover on outside click
+    useEffect(() => {
+        if (!envOpen) return;
+        const handler = (e: MouseEvent) => {
+            if (panelRef.current && !panelRef.current.contains(e.target as Node)) {
+                setEnvOpen(false);
+            }
+        };
+        document.addEventListener('mousedown', handler);
+        return () => document.removeEventListener('mousedown', handler);
+    }, [envOpen]);
+
+    const btnBase: React.CSSProperties = {
+        width: 40, height: 40,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        borderRadius: '50%',
+        border: 'none',
+        cursor: 'pointer',
+        transition: 'background 0.15s, color 0.15s',
+    };
+
+    const btnOff: React.CSSProperties = {
+        ...btnBase,
+        background: 'transparent',
+        color: '#64748b',
+    };
+
+    const btnOn: React.CSSProperties = {
+        ...btnBase,
+        background: 'rgba(213,180,81,0.15)',
+        color: '#D5B451',
+    };
+
+    return (
+        <div
+            ref={panelRef}
+            style={{
+                position: 'absolute',
+                right: 12,
+                top: '50%',
+                transform: 'translateY(-50%)',
+                zIndex: 20,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+            }}
+        >
+            {/* Vertical pill */}
+            <div
+                style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: 2,
+                    padding: '6px 6px',
+                    borderRadius: 24,
+                    background: 'rgba(6,21,37,0.85)',
+                    border: '1px solid rgba(26,58,90,0.5)',
+                    backdropFilter: 'blur(8px)',
+                }}
+            >
+                {/* Color View Mode toggle */}
+                {colorViewMode && onColorViewModeChange && (
+                    <>
+                        <button
+                            onClick={() => onColorViewModeChange(colorViewMode === 'original' ? 'colored' : 'original')}
+                            title={colorViewMode === 'original' ? 'Show colored parts' : 'Show original textures'}
+                            style={colorViewMode === 'colored' ? btnOn : btnOff}
+                        >
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <circle cx="12" cy="12" r="10" /><path d="M12 2a15 15 0 0 1 0 20" /><path d="M12 2a15 15 0 0 0 0 20" /><path d="M2 12h20" />
+                            </svg>
+                        </button>
+                        <div style={{ width: 24, height: 1, background: 'rgba(26,58,90,0.5)' }} />
+                    </>
+                )}
+
+                {/* Environment */}
+                <button
+                    onClick={() => setEnvOpen(v => !v)}
+                    title="Environment Settings"
+                    style={envOpen ? btnOn : btnOff}
+                >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <circle cx="12" cy="12" r="4" /><path d="M12 2v2" /><path d="M12 20v2" /><path d="M4.93 4.93l1.41 1.41" /><path d="M17.66 17.66l1.41 1.41" /><path d="M2 12h2" /><path d="M20 12h2" /><path d="M6.34 17.66l-1.41 1.41" /><path d="M19.07 4.93l-1.41 1.41" />
+                    </svg>
+                </button>
+
+                <div style={{ width: 24, height: 1, background: 'rgba(26,58,90,0.5)' }} />
+
+                {/* Grid */}
+                <button
+                    onClick={onToggleGrid}
+                    title="Toggle Grid"
+                    style={gridVisible ? btnOn : btnOff}
+                >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <rect x="3" y="3" width="7" height="7" /><rect x="14" y="3" width="7" height="7" /><rect x="3" y="14" width="7" height="7" /><rect x="14" y="14" width="7" height="7" />
+                    </svg>
+                </button>
+
+                <div style={{ width: 24, height: 1, background: 'rgba(26,58,90,0.5)' }} />
+
+                {/* Ground */}
+                <button
+                    onClick={onToggleGround}
+                    title="Ground model on grid plane"
+                    style={grounded ? btnOn : btnOff}
+                >
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M12 5v14" /><path d="M19 12l-7 7-7-7" /><path d="M4 21h16" />
+                    </svg>
+                </button>
+            </div>
+
+            {/* Environment popover */}
+            {envOpen && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        right: 60,
+                        top: 0,
+                        width: 240,
+                        borderRadius: 12,
+                        background: 'rgba(13,13,24,0.97)',
+                        border: '1px solid #333355',
+                        padding: 16,
+                        backdropFilter: 'blur(12px)',
+                        boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+                    }}
+                >
+                    {/* Header */}
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                        <span style={{ fontSize: 13, fontWeight: 600, color: '#e2e8f0' }}>Environment</span>
+                        <button
+                            onClick={() => setEnvOpen(false)}
+                            style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 16, lineHeight: 1 }}
+                        >
+                            ✕
+                        </button>
+                    </div>
+
+                    {/* Intensity */}
+                    <div style={{ marginBottom: 14 }}>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                            <span style={{ fontSize: 11, color: '#94a3b8' }}>Intensity</span>
+                            <span style={{ fontSize: 11, color: '#e2e8f0', fontFamily: 'monospace' }}>{envIntensity.toFixed(2)}</span>
+                        </div>
+                        <input
+                            type="range"
+                            min={0} max={3} step={0.05}
+                            value={envIntensity}
+                            onChange={e => onEnvIntensityChange(parseFloat(e.target.value))}
+                            style={{ width: '100%', accentColor: '#D5B451', height: 4 }}
+                        />
+                    </div>
+
+                    {/* Rotation */}
+                    <div>
+                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                            <span style={{ fontSize: 11, color: '#94a3b8' }}>Rotation</span>
+                            <span style={{ fontSize: 11, color: '#e2e8f0', fontFamily: 'monospace' }}>{Math.round(envRotation)}°</span>
+                        </div>
+                        <input
+                            type="range"
+                            min={0} max={360} step={1}
+                            value={envRotation}
+                            onChange={e => onEnvRotationChange(parseFloat(e.target.value))}
+                            style={{ width: '100%', accentColor: '#D5B451', height: 4 }}
+                        />
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}
+
 // ─── Split View ───────────────────────────────────────────────────────────────
 
 interface SplitViewportProps
@@ -1050,7 +1431,7 @@ function SplitViewport({
 export default function ThreeViewport({
     modelUrl,
     pointCloudUrl,
-    showGrid = true,
+    showGrid: showGridProp = false,
     showAxes = true,
     transformMode = null,
     renderMode = 'textured',
@@ -1070,16 +1451,24 @@ export default function ThreeViewport({
     className = '',
     statsData,
     isGenerating = false,
+    generatingProgress,
+    generatingLabel = 'Generating',
     onSceneReady,
     onSceneGraphChange,
     selectedObjectIds,
     onObjectMultiSelect,
     onThumbnailReady,
     onHasSkinnedMesh,
+    colorViewMode,
+    onColorViewModeChange,
 }: ThreeViewportProps) {
     const [isFirstPerson, setIsFirstPerson] = useState(false);
     const [sceneStats, setSceneStats] = useState({ faces: 0, vertices: 0 });
     const [hasSkinnedMesh, setHasSkinnedMesh] = useState(false);
+    const [gridVisible, setGridVisible] = useState(showGridProp);
+    const [grounded, setGrounded] = useState(false);
+    const [envIntensity, setEnvIntensity] = useState(1.2);
+    const [envRotation, setEnvRotation] = useState(0);
 
     // Reset SkinnedMesh flag whenever the model URL changes
     useEffect(() => { setHasSkinnedMesh(false); }, [modelUrl]);
@@ -1117,7 +1506,7 @@ export default function ThreeViewport({
                         rightLabel={rightLabel}
                         modelUrl={modelUrl}
                         pointCloudUrl={pointCloudUrl}
-                        showGrid={showGrid}
+                        showGrid={gridVisible}
                         showAxes={showAxes}
                         hdrUrl={hdrUrl}
                     >
@@ -1139,18 +1528,30 @@ export default function ThreeViewport({
                 background: '#1a1a2e',
             }}
         >
+            {/* Radial vignette glow — rendered before Canvas so it sits behind 3D content */}
+            <div
+                style={{
+                    position: 'absolute',
+                    inset: 0,
+                    pointerEvents: 'none',
+                    background: 'radial-gradient(circle at 50% 50%, rgba(150,150,190,0.45) 0%, rgba(80,80,130,0.15) 30%, transparent 65%)',
+                    filter: 'blur(30px)',
+                }}
+            />
+
             <ViewportErrorBoundary>
                 <Suspense fallback={<ViewportLoadingFallback />}>
                     <Canvas
                         shadows
                         gl={{
                             antialias: true,
+                            alpha: true,
                             toneMapping: THREE.ACESFilmicToneMapping,
                             toneMappingExposure: 1.2,
                             outputColorSpace: THREE.SRGBColorSpace,
                             preserveDrawingBuffer: !!onThumbnailReady,
                         }}
-                        style={{ width: '100%', height: '100%', background: '#1a1a2e' }}
+                        style={{ width: '100%', height: '100%', background: 'transparent' }}
                         onPointerMissed={(e) => {
                             if (e.type === 'click') onObjectSelect?.(null);
                         }}
@@ -1159,8 +1560,11 @@ export default function ThreeViewport({
                             <MainScene
                                 modelUrl={modelUrl}
                                 pointCloudUrl={pointCloudUrl}
-                                showGrid={showGrid}
+                                showGrid={gridVisible}
                                 showAxes={showAxes}
+                                grounded={grounded}
+                                envIntensity={envIntensity}
+                                envRotation={envRotation}
                                 transformMode={transformMode}
                                 renderMode={renderMode}
                                 selectedObjectId={selectedObjectId}
@@ -1173,7 +1577,6 @@ export default function ThreeViewport({
                                 isFirstPerson={isFirstPerson}
                                 onExitFirstPerson={handleExitFirstPerson}
                                 onSceneStats={showStats && !statsData ? handleSceneStats : undefined}
-                                isGenerating={isGenerating}
                                 onSceneReady={onSceneReady}
                                 onSceneGraphChange={onSceneGraphChange}
                                 selectedObjectIds={selectedObjectIds}
@@ -1192,6 +1595,77 @@ export default function ThreeViewport({
             </ViewportErrorBoundary>
 
             {/* HTML Overlays (outside Canvas) */}
+
+            {/* Progress bar overlay — shown during AI generation */}
+            {isGenerating && (
+                <div
+                    style={{
+                        position: 'absolute',
+                        top: '50%',
+                        left: '50%',
+                        transform: 'translate(-50%, -50%)',
+                        zIndex: 25,
+                        pointerEvents: 'none',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        gap: 8,
+                    }}
+                >
+                    {/* Label + percentage */}
+                    <div
+                        style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: 8,
+                            fontSize: 11,
+                            fontWeight: 500,
+                            color: '#D5B451',
+                        }}
+                    >
+                        <span>{generatingLabel}</span>
+                        {generatingProgress != null && (
+                            <span style={{ fontFamily: 'monospace', color: 'rgba(213,180,81,0.7)' }}>
+                                {Math.round(generatingProgress)}%
+                            </span>
+                        )}
+                    </div>
+                    {/* Bar track */}
+                    <div
+                        style={{
+                            width: 160,
+                            height: 3,
+                            background: 'rgba(213,180,81,0.12)',
+                            borderRadius: 2,
+                            overflow: 'hidden',
+                        }}
+                    >
+                        {generatingProgress != null ? (
+                            /* Determinate bar */
+                            <div
+                                style={{
+                                    height: '100%',
+                                    width: `${Math.min(100, Math.max(0, generatingProgress))}%`,
+                                    background: 'linear-gradient(90deg, #D5B451, #f0d88a)',
+                                    borderRadius: 2,
+                                    transition: 'width 0.4s ease',
+                                }}
+                            />
+                        ) : (
+                            /* Indeterminate shimmer */
+                            <div
+                                className="animate-progress-indeterminate"
+                                style={{
+                                    height: '100%',
+                                    width: '40%',
+                                    background: 'linear-gradient(90deg, transparent, #D5B451, transparent)',
+                                    borderRadius: 2,
+                                }}
+                            />
+                        )}
+                    </div>
+                </div>
+            )}
 
             {/* SkinnedMesh warning banner */}
             {hasSkinnedMesh && (
@@ -1229,6 +1703,20 @@ export default function ThreeViewport({
                     topology={statsData?.topology ?? 'Triangle'}
                 />
             )}
+
+            {/* Right-side viewport toolbar */}
+            <ViewportSettingsToolbar
+                gridVisible={gridVisible}
+                onToggleGrid={() => setGridVisible(v => !v)}
+                grounded={grounded}
+                onToggleGround={() => setGrounded(v => !v)}
+                envIntensity={envIntensity}
+                onEnvIntensityChange={setEnvIntensity}
+                envRotation={envRotation}
+                onEnvRotationChange={setEnvRotation}
+                colorViewMode={colorViewMode}
+                onColorViewModeChange={onColorViewModeChange}
+            />
 
             {/* First-person crosshair */}
             {isFirstPerson && <CrosshairOverlay />}

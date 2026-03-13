@@ -1,5 +1,6 @@
 'use client';
 
+import { usePathname } from 'next/navigation';
 import TopNavBar from '@/components/shared/TopNavBar';
 import LeftIconSidebar from '@/components/shared/LeftIconSidebar';
 import AssetsPanel from '@/components/shared/AssetsPanel';
@@ -11,6 +12,9 @@ interface WorkspaceLayoutProps {
 }
 
 export default function WorkspaceLayout({ children }: WorkspaceLayoutProps) {
+    const pathname = usePathname();
+    const defaultTab = pathname?.startsWith('/workspace/segment') ? 'scene' as const : 'assets' as const;
+
     return (
         <WorkspaceProvider>
             <div className="flex flex-col h-screen overflow-hidden bg-bg-primary">
@@ -20,7 +24,7 @@ export default function WorkspaceLayout({ children }: WorkspaceLayoutProps) {
                     <main className="flex-1 overflow-hidden">
                         {children}
                     </main>
-                    <AssetsPanel />
+                    <AssetsPanel key={defaultTab} defaultTab={defaultTab} />
                 </div>
             </div>
             {/* Full-screen image overlay — shared across all workspace pages */}

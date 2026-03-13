@@ -38,7 +38,7 @@ export default function TopNavBar({ className }: TopNavBarProps) {
                         className="w-[24px] h-[24px] flex items-center justify-center rounded-[6px]"
                     />
                     <span
-                        className="text-white font-bold text-[15px]"
+                        className="font-bold text-[15px] animate-glow-pulse"
                         style={{ letterSpacing: 2 }}
                     >
                         PHIDIAS

@@ -12,17 +12,23 @@ import type { TransformValues } from '@/components/shared/TransformPanel';
 import type { HierarchyItem } from '@/components/shared/HierarchyPanel';
 import { findObjectInScene, transformDataToValues } from '@/lib/scene';
 import { GLTFExporter } from 'three/examples/jsm/exporters/GLTFExporter.js';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useSegmentStore } from '@/store/segment-store';
+import { segment3D, downloadPhidiasImage, smartOrganize } from '@/lib/api/phidias';
+import type { SmartOrganizeResult } from '@/lib/api/phidias';
 
 const ThreeViewport = dynamic(() => import('@/components/shared/ThreeViewport'), {
     ssr: false,
     loading: () => (
         <div className="w-full h-full flex items-center justify-center bg-[#1a1a2e]">
-            <div
-                className="w-8 h-8 border-2 border-t-transparent rounded-full animate-spin"
-                style={{ borderColor: '#f5a623', borderTopColor: 'transparent' }}
-            />
+            <div className="flex flex-col items-center">
+                <div className="relative w-10 h-10">
+                    <div className="absolute inset-0 rounded-full animate-spin" style={{ border: '2px solid transparent', borderTopColor: '#D5B451', borderRightColor: 'rgba(213,180,81,0.3)' }} />
+                    <div className="absolute inset-1.5 rounded-full animate-spin" style={{ border: '1.5px solid transparent', borderBottomColor: 'rgba(139,124,200,0.6)', animationDirection: 'reverse', animationDuration: '1.5s' }} />
+                </div>
+                <p className="text-[#64748b] text-[11px] mt-3 tracking-wide">Loading viewport</p>
+            </div>
         </div>
     ),
 });
@@ -48,13 +54,6 @@ const SEGMENT_PALETTE = [
     '#f97316', '#a855f7', '#14b8a6', '#eab308',
 ];
 
-// Realistic P3-SAM part names for the mock result
-const MOCK_PART_NAMES = [
-    'Body Shell', 'Front Bumper', 'Rear Bumper', 'Hood',
-    'Door (L)', 'Door (R)', 'Roof Panel', 'Trunk Lid',
-    'Wheel (FL)', 'Wheel (FR)', 'Wheel (RL)', 'Wheel (RR)',
-    'Windshield', 'Side Mirror (L)', 'Side Mirror (R)', 'Exhaust',
-];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -68,6 +67,55 @@ function flattenMeshes(items: HierarchyItem[]): HierarchyItem[] {
     }
     walk(items);
     return result;
+}
+
+/** Scan the scene graph for merged / group nodes and return Part descriptors. */
+function detectMergedAndGroupNodes(
+    nodes: HierarchyItem[],
+    palette: string[],
+    colorOffset: number,
+): { mergedParts: Part[]; groupParts: Part[]; claimedMeshIds: Set<string> } {
+    const mergedParts: Part[] = [];
+    const groupParts: Part[] = [];
+    const claimedMeshIds = new Set<string>();
+    let idx = colorOffset;
+
+    function walk(items: HierarchyItem[]) {
+        for (const n of items) {
+            if (n.type === 'group' && n.id.startsWith('merged_') && n.children) {
+                const childMeshIds = flattenMeshes(n.children).map(m => m.id);
+                if (childMeshIds.length > 0) {
+                    const color = palette[idx++ % palette.length];
+                    mergedParts.push({
+                        id: n.id,
+                        name: n.name,
+                        color,
+                        visible: n.visible,
+                        meshIds: childMeshIds,
+                    });
+                    childMeshIds.forEach(mid => claimedMeshIds.add(mid));
+                }
+            } else if (n.type === 'group' && n.id.startsWith('group_') && n.children) {
+                // Collect direct child IDs (both mesh parts and merged parts)
+                const childIds = n.children.map(c => c.id);
+                groupParts.push({
+                    id: n.id,
+                    name: n.name || `Group (${childIds.length})`,
+                    color: '#94a3b8',
+                    visible: n.visible,
+                    meshIds: [],
+                    isGroup: true,
+                    childIds,
+                });
+                // Recurse into group children to find nested merged nodes
+                walk(n.children);
+            } else if (n.children) {
+                walk(n.children);
+            }
+        }
+    }
+    walk(nodes);
+    return { mergedParts, groupParts, claimedMeshIds };
 }
 
 function buildSegmentColors(parts: Part[]): Record<string, string> {
@@ -97,62 +145,249 @@ function partsToHierarchyItems(parts: Part[]): HierarchyItem[] {
     });
 }
 
-// ─── Mock P3-SAM segmentation ─────────────────────────────────────────────────
-// Simulates the backend POST /segment/3d call.
-// In production this would POST the current GLB and receive a segmented GLB + part labels.
+// ─── Screenshot helpers ──────────────────────────────────────────────────────
 
-function simulateP3SAMSegmentation(
-    params: P3SAMParams,
-    availableMeshIds: string[],
-    onProgress: (pct: number) => void,
-    signal: AbortSignal
-): Promise<SegmentResult[]> {
+/** Camera angles for multi-view capture: [azimuth°, elevation°, label] */
+const CAPTURE_ANGLES: [number, number, string][] = [
+    [30, 20, 'front-right'],
+    [210, 20, 'back-left'],
+    [120, 60, 'top-side'],
+];
+
+/** Render the scene group from a specific angle to a PNG Blob. */
+function renderFromAngle(
+    renderer: THREE.WebGLRenderer,
+    scene: THREE.Scene,
+    camera: THREE.PerspectiveCamera,
+    group: THREE.Group,
+    center: THREE.Vector3,
+    dist: number,
+    azimuthDeg: number,
+    elevationDeg: number,
+): Promise<Blob> {
+    const az = (azimuthDeg * Math.PI) / 180;
+    const el = (elevationDeg * Math.PI) / 180;
+    camera.position.set(
+        center.x + dist * Math.cos(el) * Math.sin(az),
+        center.y + dist * Math.sin(el),
+        center.z + dist * Math.cos(el) * Math.cos(az),
+    );
+    camera.lookAt(center);
+    renderer.render(scene, camera);
+
+    return new Promise<Blob>((resolve, reject) => {
+        renderer.domElement.toBlob(
+            (blob) => blob ? resolve(blob) : reject(new Error('Screenshot capture failed')),
+            'image/png',
+        );
+    });
+}
+
+/** Swap all mesh materials to segment colors, returns a restore function. */
+function applySegmentColorMaterials(
+    group: THREE.Group,
+    parts: Part[],
+): () => void {
+    const overrides: { mesh: THREE.Mesh; origMat: THREE.Material | THREE.Material[] }[] = [];
+    const colorMap = new Map<string, string>();
+    for (const p of parts) {
+        const color = p.color || '';
+        if (color) p.meshIds.forEach(mid => colorMap.set(mid, color));
+    }
+
+    group.traverse((child) => {
+        if (!(child instanceof THREE.Mesh)) return;
+        const id = child.name || child.uuid;
+        const color = colorMap.get(id);
+        if (color) {
+            overrides.push({ mesh: child, origMat: child.material });
+            child.material = new THREE.MeshStandardMaterial({
+                color, roughness: 0.6, metalness: 0.1,
+            });
+        }
+    });
+
+    return () => {
+        for (const { mesh, origMat } of overrides) {
+            mesh.material = origMat;
+        }
+    };
+}
+
+/**
+ * Capture multi-angle screenshots in both original and colored modes.
+ * Returns { original: Blob[], colored: Blob[] } — one per CAPTURE_ANGLES entry.
+ */
+async function captureMultiViewScreenshots(
+    group: THREE.Group,
+    parts: Part[],
+): Promise<{ original: Blob[]; colored: Blob[] }> {
+    const w = 768, h = 768;
+    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, alpha: false });
+    renderer.setSize(w, h);
+    renderer.setPixelRatio(1);
+    renderer.setClearColor(0x1a1a2e, 1);
+
+    const box = new THREE.Box3().setFromObject(group);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z) || 1;
+    const dist = maxDim * 1.8;
+
+    const camera = new THREE.PerspectiveCamera(50, 1, 0.01, maxDim * 100);
+
+    const tempScene = new THREE.Scene();
+    tempScene.add(new THREE.AmbientLight(0xffffff, 0.8));
+    const dir = new THREE.DirectionalLight(0xffffff, 1);
+    dir.position.set(1, 2, 1);
+    tempScene.add(dir);
+
+    const savedParent = group.parent;
+    tempScene.add(group);
+
+    // 1. Capture original texture from all angles
+    const original: Blob[] = [];
+    for (const [az, el] of CAPTURE_ANGLES) {
+        original.push(await renderFromAngle(renderer, tempScene, camera, group, center, dist, az, el));
+    }
+
+    // 2. Swap to segment colors and capture from all angles
+    const restoreMaterials = applySegmentColorMaterials(group, parts);
+    const colored: Blob[] = [];
+    for (const [az, el] of CAPTURE_ANGLES) {
+        colored.push(await renderFromAngle(renderer, tempScene, camera, group, center, dist, az, el));
+    }
+    restoreMaterials();
+
+    // Restore parent
+    tempScene.remove(group);
+    if (savedParent) savedParent.add(group);
+    renderer.dispose();
+
+    return { original, colored };
+}
+
+/** Read the material colour of every Mesh child in the scene group. */
+function getMeshColors(group: THREE.Group): { id: string; color: string }[] {
+    const result: { id: string; color: string }[] = [];
+    group.traverse((child) => {
+        if (child instanceof THREE.Mesh) {
+            const mat = child.material as THREE.MeshStandardMaterial;
+            if (mat?.color) {
+                result.push({ id: child.name || child.uuid, color: '#' + mat.color.getHexString() });
+            }
+        }
+    });
+    return result;
+}
+
+// ─── splitSegmentedGlb ────────────────────────────────────────────────────────
+// P3-SAM returns a single mesh with COLOR_0 vertex attributes (one color per
+// segment).  This helper splits it into one Three.js Mesh per colour group so
+// that the scene graph contains selectable individual parts.
+// The per-group material colour comes from P3-SAM's vertex colours — no
+// SEGMENT_PALETTE is applied here.
+async function splitSegmentedGlb(blob: Blob): Promise<Blob> {
     return new Promise((resolve, reject) => {
-        // Estimate runtime based on point density (just for the mock)
-        const totalMs = 2000 + (params.point_num / 100000) * 1500;
-        const tickMs = 150;
-        let elapsed = 0;
+        const url = URL.createObjectURL(blob);
+        const loader = new GLTFLoader();
+        loader.load(url, (gltf) => {
+            URL.revokeObjectURL(url);
+            const scene = gltf.scene;
+            const toProcess: THREE.Mesh[] = [];
+            scene.traverse((child) => {
+                if (child instanceof THREE.Mesh) toProcess.push(child);
+            });
 
-        const tick = () => {
-            if (signal.aborted) {
-                reject(new DOMException('Aborted', 'AbortError'));
-                return;
+            for (const child of toProcess) {
+                const geo = child.geometry as THREE.BufferGeometry;
+                const colorAttr = geo.getAttribute('color') as THREE.BufferAttribute | undefined;
+                if (!colorAttr) continue;
+
+                const posAttr = geo.getAttribute('position') as THREE.BufferAttribute;
+                const normAttr = geo.getAttribute('normal') as THREE.BufferAttribute | undefined;
+                const uvAttr = geo.getAttribute('uv') as THREE.BufferAttribute | undefined;
+                const indexAttr = geo.index;
+
+                // Group face starts by the first vertex's RGB colour (0-255 key)
+                const colorGroups = new Map<string, number[]>();
+                const faceCount = indexAttr ? indexAttr.count / 3 : posAttr.count / 3;
+                for (let f = 0; f < faceCount; f++) {
+                    const vi = indexAttr ? indexAttr.getX(f * 3) : f * 3;
+                    const r = Math.round(colorAttr.getX(vi) * 255);
+                    const g = Math.round(colorAttr.getY(vi) * 255);
+                    const b = Math.round(colorAttr.getZ(vi) * 255);
+                    const key = `${r},${g},${b}`;
+                    if (!colorGroups.has(key)) colorGroups.set(key, []);
+                    colorGroups.get(key)!.push(f);
+                }
+
+                if (colorGroups.size <= 1) continue; // nothing to split
+
+                const parent = child.parent ?? scene;
+                let partIndex = 0;
+
+                for (const [colorKey, faces] of Array.from(colorGroups.entries())) {
+                    const positions: number[] = [];
+                    const normals: number[] = [];
+                    const uvs: number[] = [];
+
+                    for (const f of faces) {
+                        for (let j = 0; j < 3; j++) {
+                            const vi = indexAttr ? indexAttr.getX(f * 3 + j) : f * 3 + j;
+                            positions.push(posAttr.getX(vi), posAttr.getY(vi), posAttr.getZ(vi));
+                            if (normAttr) normals.push(normAttr.getX(vi), normAttr.getY(vi), normAttr.getZ(vi));
+                            if (uvAttr) uvs.push(uvAttr.getX(vi), uvAttr.getY(vi));
+                        }
+                    }
+
+                    const newGeo = new THREE.BufferGeometry();
+                    newGeo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+                    if (normals.length) newGeo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+                    if (uvs.length) newGeo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+
+                    const [r, g, b] = colorKey.split(',').map(Number);
+                    const mat = new THREE.MeshStandardMaterial({
+                        color: new THREE.Color(r / 255, g / 255, b / 255),
+                    });
+
+                    const mesh = new THREE.Mesh(newGeo, mat);
+                    mesh.name = `part_${partIndex}`;
+                    mesh.applyMatrix4(child.matrixWorld);
+                    parent.add(mesh);
+                    partIndex++;
+                }
+
+                parent.remove(child);
             }
-            elapsed += tickMs;
-            onProgress(Math.min((elapsed / totalMs) * 100, 97));
-            if (elapsed < totalMs) {
-                setTimeout(tick, tickMs);
-            } else {
-                // Generate mock results: 4–8 parts depending on threshold
-                const partCount = Math.max(4, Math.min(8, Math.round(8 * (1 - params.threshold) + 4)));
-                // Distribute available meshes across parts
-                const chunkSize = Math.ceil(availableMeshIds.length / partCount);
 
-                const results: SegmentResult[] = Array.from({ length: partCount }, (_, i) => ({
-                    id: `ai-part-${i}`,
-                    name: MOCK_PART_NAMES[i] ?? `Part ${i + 1}`,
-                    color: SEGMENT_PALETTE[i % SEGMENT_PALETTE.length],
-                    // Mock IoU score — slightly randomized for realism
-                    score: parseFloat((0.75 + Math.random() * 0.22).toFixed(3)),
-                    meshIds: availableMeshIds.slice(i * chunkSize, (i + 1) * chunkSize),
-                }));
-
-                onProgress(100);
-                setTimeout(() => resolve(results), 200);
-            }
-        };
-        setTimeout(tick, tickMs);
+            const exporter = new GLTFExporter();
+            exporter.parse(
+                scene,
+                (result) => resolve(new Blob([result as ArrayBuffer], { type: 'model/gltf-binary' })),
+                (err) => reject(err),
+                { binary: true },
+            );
+        }, undefined, (err) => {
+            URL.revokeObjectURL(url);
+            reject(err);
+        });
     });
 }
 
 // ─── Page component ──────────────────────────────────────────────────────────
 
 export default function SegmentPage() {
-    const { setSceneGraph, setSegmentHierarchy, assets, activeAssetId, updateAsset } = useWorkspace();
+    const { setSceneGraph, setSegmentHierarchy, assets, activeAssetId, updateAsset, updateAssetThumbnail } = useWorkspace();
     const activeModelUrl = assets.find(a => a.id === activeAssetId)?.modelUrl ?? null;
 
     const sceneRef = useRef<THREE.Group | null>(null);
     const abortRef = useRef<AbortController | null>(null);
+
+    // When true, the next handleSceneGraphChange call assigns SEGMENT_PALETTE
+    // colours to the newly created parts (set right before model replacement
+    // after segmentation).
+    const pendingColorRef = useRef(false);
 
     // ── Mesh registry for scene rebuild on undo/redo ──────────────────────────
     // meshRegistryRef: meshId → { obj, origParent } — built at scene-ready time
@@ -176,8 +411,42 @@ export default function SegmentPage() {
     // can call the latest version without being a stale closure.
     const rebuildRef = useRef<(parts: Part[]) => void>(() => { });
 
+    // ── View mode: 'original' shows native materials, 'colored' shows palette ──
+    // Initialize from store: if parts already have colors (e.g. tab switch), start in 'colored'.
+    const [viewMode, setViewMode] = useState<'original' | 'colored'>(() => {
+        const stored = useSegmentStore.getState().parts;
+        return stored.some(p => p.color !== '') ? 'colored' : 'original';
+    });
+
+    // When switching to colored mode, auto-assign palette colors to parts that lack them
+    const handleViewModeChange = useCallback((mode: 'original' | 'colored') => {
+        if (mode === 'colored') {
+            const current = useSegmentStore.getState().parts;
+            const needsColors = current.filter(p => !p.isGroup && !p.color);
+            if (needsColors.length > 0) {
+                const updated = current.map((p, i) => {
+                    if (!p.isGroup && !p.color) {
+                        return { ...p, color: SEGMENT_PALETTE[i % SEGMENT_PALETTE.length] };
+                    }
+                    return p;
+                });
+                setParts(updated);
+            }
+        }
+        setViewMode(mode);
+    }, [setParts]);
+
     // Derive colors and meshId map from parts (replaces explicit setState calls)
-    const segmentColors = useMemo(() => buildSegmentColors(parts), [parts]);
+    const segmentColors = useMemo(() => {
+        if (viewMode === 'original') return {};
+        // Build colors with fallback for parts that somehow still lack a color
+        const colors: Record<string, string> = {};
+        parts.forEach((p, i) => {
+            const color = p.color || SEGMENT_PALETTE[i % SEGMENT_PALETTE.length];
+            p.meshIds.forEach(mid => { colors[mid] = color; });
+        });
+        return colors;
+    }, [parts, viewMode]);
     const meshToPartId = useMemo(() => buildMeshToPartId(parts), [parts]);
 
     // AI segmentation state
@@ -185,6 +454,7 @@ export default function SegmentPage() {
     const [segmentProgress, setSegmentProgress] = useState(0);
     const [segmentError, setSegmentError] = useState<string | null>(null);
     const [aiResults, setAiResults] = useState<SegmentResult[]>([]);
+    const [isOrganizing, setIsOrganizing] = useState(false);
 
     // ── Selection state ────────────────────────────────────────────────────────
     const [selectedPartIds, setSelectedPartIds] = useState<string[]>([]);
@@ -325,16 +595,110 @@ export default function SegmentPage() {
 
     const handleSceneGraphChange = useCallback((nodes: HierarchyItem[]) => {
         const meshes = flattenMeshes(nodes);
-        const newParts: Part[] = meshes.map((m, i) => ({
-            id: m.id,
-            name: m.name,
-            color: SEGMENT_PALETTE[i % SEGMENT_PALETTE.length],
-            visible: m.visible,
-            meshIds: [m.id],
-        }));
-        // Model load must NOT enter zundo history — pause recording, apply
-        // the new parts, resume, then clear so the user can never undo back
-        // to a state before the current model was loaded.
+        let assignColors = pendingColorRef.current;
+        if (assignColors) {
+            pendingColorRef.current = false;
+        }
+
+        // Auto-assign colors when a natively multi-part model is loaded.
+        // Triggers when: (a) store is empty, or (b) mesh IDs don't match existing parts
+        // (indicating a new/different model was loaded).
+        const existing = useSegmentStore.getState().parts;
+        if (!assignColors && meshes.length > 1) {
+            const existingMeshIds = new Set(existing.flatMap(p => p.meshIds));
+            const newMeshIds = meshes.map(m => m.id);
+            const isNewModel = existing.length === 0 || newMeshIds.some(id => !existingMeshIds.has(id));
+            if (isNewModel) {
+                assignColors = true;
+            }
+        }
+
+        if (assignColors) {
+            setViewMode('colored');
+        }
+
+        // Detect merged_*/group_* groups baked into the GLB scene graph.
+        // This covers both fresh import of a previously-exported GLB and
+        // tab-switch remounts where the store already has merge info.
+        const {
+            mergedParts: sceneMerged,
+            groupParts: sceneGroups,
+            claimedMeshIds: sceneClaimedMeshIds,
+        } = detectMergedAndGroupNodes(nodes, SEGMENT_PALETTE, meshes.length);
+
+        // Preserve existing part colors/names on tab-switch remounts
+        const existingMap = new Map(existing.map(p => [p.id, p]));
+
+        // Collect meshIds claimed by store-based merged parts (tab-switch case)
+        const storeMerged = existing.filter(p => !p.isGroup && p.meshIds.length > 1);
+        const allClaimedMeshIds = new Set([
+            ...Array.from(sceneClaimedMeshIds),
+            ...storeMerged.flatMap(p => p.meshIds),
+        ]);
+
+        const meshIdSet = new Set(meshes.map(m => m.id));
+
+        // Build individual parts for unclaimed meshes
+        const newParts: Part[] = meshes
+            .filter(m => !allClaimedMeshIds.has(m.id))
+            .map((m, i) => {
+                const prev = existingMap.get(m.id);
+                return {
+                    id: m.id,
+                    name: prev?.name ?? m.name,
+                    color: assignColors
+                        ? SEGMENT_PALETTE[i % SEGMENT_PALETTE.length]
+                        : (prev?.color ?? ''),
+                    visible: m.visible,
+                    meshIds: [m.id],
+                    parentId: prev?.parentId,
+                };
+            });
+
+        // Insert merged parts detected from the scene graph (fresh import)
+        for (const mp of sceneMerged) {
+            // If the store already has this merged part, prefer store version (has user edits)
+            const storeVersion = existingMap.get(mp.id);
+            newParts.push(storeVersion ? { ...storeVersion } : mp);
+        }
+
+        // Insert merged parts from the store that aren't in the scene graph (tab-switch)
+        for (const sp of storeMerged) {
+            if (!newParts.some(p => p.id === sp.id) && sp.meshIds.every(mid => meshIdSet.has(mid))) {
+                newParts.push({ ...sp });
+            }
+        }
+
+        // Insert group parts detected from the scene graph (fresh import)
+        for (const gp of sceneGroups) {
+            if (!newParts.some(p => p.id === gp.id)) {
+                // Set parentId on children
+                gp.childIds?.forEach(cid => {
+                    const child = newParts.find(p => p.id === cid);
+                    if (child) child.parentId = gp.id;
+                });
+                // Insert before the first child
+                const insertAt = newParts.findIndex(p => gp.childIds?.includes(p.id));
+                if (insertAt >= 0) {
+                    newParts.splice(insertAt, 0, gp);
+                } else {
+                    newParts.push(gp);
+                }
+            }
+        }
+
+        // Re-insert group parts from the store (tab-switch)
+        for (const ep of existing) {
+            if (ep.isGroup && !newParts.some(p => p.id === ep.id) &&
+                ep.childIds?.some(cid => meshIdSet.has(cid) || newParts.some(p => p.id === cid))
+            ) {
+                const insertAt = newParts.findIndex(p => ep.childIds?.includes(p.id));
+                if (insertAt >= 0) {
+                    newParts.splice(insertAt, 0, { ...ep });
+                }
+            }
+        }
+
         const temporal = useSegmentStore.temporal.getState();
         temporal.pause();
         setParts(newParts);
@@ -621,15 +985,32 @@ export default function SegmentPage() {
         if (!sceneRef.current || !activeAssetId || isSaving) return;
         setIsSaving(true);
         try {
+            const scene = sceneRef.current!;
+
+            // Temporarily restore original materials so saved GLB has original textures
+            const overrides: { mesh: THREE.Mesh; coloredMat: THREE.Material | THREE.Material[] }[] = [];
+            scene.traverse((child) => {
+                if (child instanceof THREE.Mesh && child.userData.__origMaterial) {
+                    overrides.push({ mesh: child, coloredMat: child.material });
+                    child.material = child.userData.__origMaterial;
+                }
+            });
+
             const exporter = new GLTFExporter();
             const glb = await new Promise<ArrayBuffer>((resolve, reject) => {
                 exporter.parse(
-                    sceneRef.current!,
+                    scene,
                     (result) => resolve(result as ArrayBuffer),
                     (err) => reject(err),
                     { binary: true }
                 );
             });
+
+            // Restore segment-color materials
+            for (const { mesh, coloredMat } of overrides) {
+                mesh.material = coloredMat;
+            }
+
             const blob = new Blob([glb], { type: 'model/gltf-binary' });
             const url = URL.createObjectURL(blob);
             updateAsset(activeAssetId, { modelUrl: url, pipelineUsed: 'segment' });
@@ -658,33 +1039,73 @@ export default function SegmentPage() {
         const controller = new AbortController();
         abortRef.current = controller;
 
-        // Gather all mesh IDs from the current scene
-        const allMeshIds = parts.flatMap(p => p.meshIds);
-
         try {
-            const results = await simulateP3SAMSegmentation(
-                params,
-                allMeshIds,
-                pct => setSegmentProgress(pct),
-                controller.signal
-            );
+            if (!sceneRef.current || !activeAssetId) throw new Error('No model loaded');
+
+            // 1. Export current scene as GLB
+            setSegmentProgress(10);
+            const exporter = new GLTFExporter();
+            const glbBuffer = await new Promise<ArrayBuffer>((resolve, reject) => {
+                exporter.parse(
+                    sceneRef.current!,
+                    (result) => resolve(result as ArrayBuffer),
+                    (err) => reject(err),
+                    { binary: true }
+                );
+            });
+
+            if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            setSegmentProgress(20);
+
+            // 2. POST to P3-SAM
+            const glbFile = new File([glbBuffer], 'model.glb', { type: 'model/gltf-binary' });
+            const segResult = await segment3D(glbFile, {
+                point_num: params.point_num,
+                prompt_num: params.prompt_num,
+                threshold: params.threshold,
+                post_process: params.post_process,
+                clean_mesh: params.clean_mesh_flag,
+                seed: params.seed,
+                prompt_bs: params.prompt_bs,
+            });
+
+            if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            setSegmentProgress(60);
+
+            // 3. Download segmented GLB from P3-SAM
+            const fileName = segResult.segmented_glb.split('/').pop() || 'segmented_output_parts.glb';
+            const rawBlob = await downloadPhidiasImage(segResult.request_id, fileName, 'p3sam');
+
+            if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            setSegmentProgress(80);
+
+            // 4. Split the single vertex-coloured mesh into one mesh per segment
+            //    so that ThreeViewport has selectable, independent parts.
+            //    No SEGMENT_PALETTE colours are applied — handleSceneGraphChange
+            //    creates parts with color:'', so ThreeViewport never overrides materials.
+            const splitBlob = await splitSegmentedGlb(rawBlob);
+            const segmentedUrl = URL.createObjectURL(splitBlob);
+
+            // 5. Replace model — handleSceneGraphChange fires and creates parts
+            //    pendingColorRef tells it to assign SEGMENT_PALETTE colours.
+            pendingColorRef.current = true;
+            updateAsset(activeAssetId, { modelUrl: segmentedUrl, pipelineUsed: 'segment' });
+
+            // 6. Build result list for the AI results panel
+            const results: SegmentResult[] = Array.from({ length: segResult.num_parts }, (_, i) => ({
+                id: `p3sam-part-${i}`,
+                name: `Part ${i + 1}`,
+                color: SEGMENT_PALETTE[i % SEGMENT_PALETTE.length],
+                score: 1.0,
+                meshIds: [],
+            }));
 
             setAiResults(results);
-
-            // Apply AI results as new parts in the scene
-            const newParts: Part[] = results.map(r => ({
-                id: r.id,
-                name: r.name,
-                color: r.color,
-                visible: true,
-                meshIds: r.meshIds,
-            }));
-            setParts(newParts);
             setSelectedPartIds([]);
             setLastClickedMeshId(null);
+            setSegmentProgress(100);
         } catch (err) {
             if (err instanceof DOMException && err.name === 'AbortError') {
-                // user cancelled — reset quietly
                 setSegmentProgress(0);
             } else {
                 setSegmentError(
@@ -694,13 +1115,94 @@ export default function SegmentPage() {
         } finally {
             setIsSegmenting(false);
         }
-    }, [parts]);
+    }, [activeAssetId, updateAsset]);
 
     const handleCancelSegmentation = useCallback(() => {
         abortRef.current?.abort();
         setIsSegmenting(false);
         setSegmentProgress(0);
     }, []);
+
+    // ── Smart Organize (VLM auto-name + auto-group) ─────────────────────────────
+
+    const handleSmartOrganize = useCallback(async () => {
+        if (!sceneRef.current || parts.length === 0) return;
+        setIsOrganizing(true);
+        setSegmentError(null);
+
+        try {
+            // 1. Read material colours from the Three.js meshes
+            const meshColors = getMeshColors(sceneRef.current);
+
+            // 2. Capture multi-angle screenshots (original + colored)
+            const { original, colored } = await captureMultiViewScreenshots(sceneRef.current, parts);
+
+            // 3. Call VLM API with all images
+            const results: SmartOrganizeResult[] = await smartOrganize(
+                original, colored,
+                CAPTURE_ANGLES.map(([,, label]) => label),
+                meshColors,
+            );
+
+            // 4. Rename parts
+            let newParts = parts.map((p) => {
+                const match = results.find((r) => r.id === p.id);
+                return match ? { ...p, name: match.name } : p;
+            });
+
+            // 5. Build groups from VLM suggestions
+            const groupMap = new Map<string, string[]>();
+            for (const r of results) {
+                if (!r.group) continue;
+                if (!groupMap.has(r.group)) groupMap.set(r.group, []);
+                groupMap.get(r.group)!.push(r.id);
+            }
+
+            for (const [groupName, memberIds] of Array.from(groupMap.entries())) {
+                if (memberIds.length < 2) continue; // only group 2+ parts
+                const groupId = `group_${groupName.toLowerCase().replace(/\s+/g, '_')}_${Date.now()}`;
+                const groupPart: Part = {
+                    id: groupId,
+                    name: groupName,
+                    color: '',
+                    visible: true,
+                    meshIds: [],
+                    isGroup: true,
+                    childIds: memberIds,
+                };
+                // Set parentId on children
+                newParts = newParts.map((p) =>
+                    memberIds.includes(p.id) ? { ...p, parentId: groupId } : p,
+                );
+                // Insert group before its first child
+                const firstIdx = newParts.findIndex((p) => memberIds.includes(p.id));
+                newParts.splice(firstIdx, 0, groupPart);
+            }
+
+            setParts(newParts);
+
+            // Rebuild Three.js groups to match
+            if (sceneRef.current) {
+                for (const part of newParts) {
+                    if (!part.isGroup || !part.childIds || part.childIds.length < 2) continue;
+                    const threeGroup = new THREE.Group();
+                    threeGroup.name = part.id;
+                    const childMeshIds = part.childIds.flatMap(
+                        (cid) => newParts.find((p) => p.id === cid)?.meshIds ?? [],
+                    );
+                    const meshObjs = childMeshIds
+                        .map((mid) => findObjectInScene(sceneRef.current!, mid))
+                        .filter((o): o is THREE.Object3D => o !== null);
+                    sceneRef.current.add(threeGroup);
+                    meshObjs.forEach((obj) => threeGroup.attach(obj));
+                }
+            }
+        } catch (err) {
+            setSegmentError(err instanceof Error ? err.message : 'Smart organize failed');
+        } finally {
+            setIsOrganizing(false);
+        }
+    }, [parts, setParts]);
 
     // Cleanup on unmount
     useEffect(() => {
@@ -777,6 +1279,8 @@ export default function SegmentPage() {
                         results={aiResults}
                         onStart={handleStartSegmentation}
                         onCancel={handleCancelSegmentation}
+                        onSmartOrganize={handleSmartOrganize}
+                        isOrganizing={isOrganizing}
                     />
                 </div>
             </aside>
@@ -786,7 +1290,7 @@ export default function SegmentPage() {
                 <Suspense fallback={null}>
                     <ThreeViewport
                         modelUrl={activeModelUrl ?? ''}
-                        showGrid
+                        showGrid={false}
                         transformMode={lastClickedMeshId ? 'translate' : null}
                         selectedObjectId={lastClickedMeshId ?? undefined}
                         selectedObjectIds={highlightedMeshIds}
@@ -805,25 +1309,15 @@ export default function SegmentPage() {
                         onSceneGraphChange={handleSceneGraphChange}
                         segmentColors={segmentColors}
                         isGenerating={isSegmenting}
+                        generatingProgress={segmentProgress}
+                        generatingLabel="Segmenting"
+                        onThumbnailReady={(dataUrl) => { if (activeAssetId) updateAssetThumbnail(activeAssetId, dataUrl); }}
                         onHasSkinnedMesh={(v) => { if (activeAssetId) updateAsset(activeAssetId, { hasSkinnedMesh: v }); }}
+                        colorViewMode={!isSegmenting ? viewMode : undefined}
+                        onColorViewModeChange={handleViewModeChange}
                         className="w-full h-full"
                     />
                 </Suspense>
-
-                {/* AI mode progress overlay on viewport */}
-                {isSegmenting && (
-                    <div
-                        className="absolute top-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-full text-xs font-medium flex items-center gap-2 z-10"
-                        style={{
-                            background: 'rgba(13,13,24,0.92)',
-                            border: '1px solid #7c3aed',
-                            color: '#a78bfa',
-                        }}
-                    >
-                        <div className="w-3 h-3 rounded-full border-2 border-[#7c3aed] border-t-transparent animate-spin" />
-                        Running P3-SAM segmentation… {Math.round(segmentProgress)}%
-                    </div>
-                )}
 
                 {/* Bottom Toolbar */}
                 <div
@@ -933,7 +1427,7 @@ export default function SegmentPage() {
             ★
           </button>
           <span className="text-xs text-[#f5a623] font-bold">⚡ 55</span> */}
-                    <ExportDropdown />
+                    <ExportDropdown sceneRef={sceneRef} />
                 </div>
             </main>
         </div>
