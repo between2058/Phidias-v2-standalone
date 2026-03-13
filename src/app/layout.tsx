@@ -17,6 +17,7 @@ export default function RootLayout({
             <body
                 className="antialiased h-full font-sans"
                 style={{ background: '#1a1a2e', color: '#ffffff' }}
+                suppressHydrationWarning
             >
                 <ConfigProvider config={createConfigStandalone()}>
                     {children}

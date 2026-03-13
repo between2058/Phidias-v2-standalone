@@ -351,12 +351,15 @@ function AssetCard({
     }, [isRenaming, asset.name]);
 
     return (
-        <button
+        <div
+            role="button"
+            tabIndex={0}
             onClick={() => (isManageMode ? onCheckToggle() : onSelect())}
+            onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); isManageMode ? onCheckToggle() : onSelect(); } }}
             onContextMenu={e => { e.preventDefault(); onContextMenu(e); }}
             onMouseEnter={() => setHovered(true)}
             onMouseLeave={() => setHovered(false)}
-            className="relative aspect-square rounded-xl overflow-hidden transition-all focus:outline-none group"
+            className="relative aspect-square rounded-xl overflow-hidden transition-all focus:outline-none group cursor-pointer"
             style={{
                 border: `2px solid ${isManageMode
                     ? isChecked ? '#7c3aed' : 'transparent'
@@ -495,7 +498,7 @@ function AssetCard({
                     </div>
                 </div>
             )}
-        </button>
+        </div>
     );
 }
 
