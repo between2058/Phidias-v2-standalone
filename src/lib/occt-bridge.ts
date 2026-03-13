@@ -85,7 +85,7 @@ export function expandHierarchy(result: CADImportResult): CADImportResult {
 
 // ─── Geometry Hash for Duplicate Detection ───────────────────────────────────
 
-function hashMesh(mesh: CADMesh): string {
+export function hashMesh(mesh: CADMesh): string {
   // Use vertex count + index count + first 12 position values as fingerprint
   const vCount = mesh.positions.length;
   const iCount = mesh.indices.length;
@@ -153,6 +153,7 @@ function createMeshObject(mesh: CADMesh): THREE.Mesh {
 function buildThreeHierarchy(
   node: CADNode,
   meshes: CADMesh[],
+  duplicateHashes?: Map<string, { geometry: THREE.BufferGeometry; material: THREE.MeshStandardMaterial; count: number }>,
 ): THREE.Object3D {
   const group = new THREE.Group();
   group.name = node.name || 'Assembly';
@@ -161,20 +162,62 @@ function buildThreeHierarchy(
   for (const meshIdx of node.meshIndices) {
     const mesh = meshes[meshIdx];
     if (mesh) {
+      if (duplicateHashes) {
+        const h = hashMesh(mesh);
+        const entry = duplicateHashes.get(h);
+        if (entry && entry.count > 1) {
+          // Use InstancedMesh for duplicates — share geometry
+          const instancedMesh = new THREE.Mesh(entry.geometry, entry.material);
+          instancedMesh.name = mesh.name || `Mesh_${mesh.index}`;
+          group.add(instancedMesh);
+          continue;
+        }
+      }
       group.add(createMeshObject(mesh));
     }
   }
 
   // Recurse children
   for (const child of node.children) {
-    group.add(buildThreeHierarchy(child, meshes));
+    group.add(buildThreeHierarchy(child, meshes, duplicateHashes));
   }
 
   return group;
 }
 
 export function cadResultToThreeGroup(result: CADImportResult): THREE.Group {
-  const root = buildThreeHierarchy(result.root, result.meshes) as THREE.Group;
+  // Detect duplicates and pre-build shared geometries
+  const duplicateGroups = detectDuplicates(result.meshes);
+  const duplicateHashes = new Map<string, { geometry: THREE.BufferGeometry; material: THREE.MeshStandardMaterial; count: number }>();
+
+  for (const group of duplicateGroups) {
+    const mesh = result.meshes[group.meshIndices[0]];
+    if (!mesh) continue;
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3));
+    if (mesh.normals) {
+      geometry.setAttribute('normal', new THREE.BufferAttribute(mesh.normals, 3));
+    } else {
+      geometry.computeVertexNormals();
+    }
+    geometry.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
+
+    const color = mesh.color
+      ? new THREE.Color(mesh.color[0], mesh.color[1], mesh.color[2])
+      : DEFAULT_COLOR;
+
+    const material = new THREE.MeshStandardMaterial({
+      color,
+      metalness: 0.1,
+      roughness: 0.6,
+      side: THREE.DoubleSide,
+    });
+
+    duplicateHashes.set(group.hash, { geometry, material, count: group.count });
+  }
+
+  const root = buildThreeHierarchy(result.root, result.meshes, duplicateHashes) as THREE.Group;
 
   // Auto-center and scale
   const box = new THREE.Box3().setFromObject(root);
@@ -189,7 +232,42 @@ export function cadResultToThreeGroup(result: CADImportResult): THREE.Group {
     root.position.set(-center.x * scale, -center.y * scale, -center.z * scale);
   }
 
+  // Log perf metrics
+  let triCount = 0;
+  let meshCount = 0;
+  root.traverse((obj) => {
+    if ((obj as THREE.Mesh).isMesh) {
+      meshCount++;
+      const geo = (obj as THREE.Mesh).geometry;
+      triCount += geo.index ? geo.index.count / 3 : geo.attributes.position.count / 3;
+    }
+  });
+  const memMB = result.meshes.reduce((sum, m) => {
+    return sum + m.positions.byteLength + (m.normals?.byteLength ?? 0) + m.indices.byteLength;
+  }, 0) / (1024 * 1024);
+
+  console.log(
+    `[CAD Import] ${meshCount} parts, ${Math.round(triCount)} tris, ~${memMB.toFixed(1)} MB raw geometry`,
+  );
+
   return root;
+}
+
+// ─── Memory Disposal ─────────────────────────────────────────────────────────
+
+/**
+ * Null out typed arrays from meshes after GLB conversion.
+ * Keeps hierarchy metadata intact for the tree UI.
+ */
+export function disposeCADMeshBuffers(result: CADImportResult): void {
+  for (const mesh of result.meshes) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mesh as any).positions = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mesh as any).normals = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (mesh as any).indices = null;
+  }
 }
 
 // ─── GLB Export (for ThreeViewport compatibility) ────────────────────────────
@@ -256,7 +334,7 @@ export function importStepFile(
 
     file.arrayBuffer().then(buffer => {
       worker.postMessage(
-        { taskId, type: 'import', buffer, fileName: file.name },
+        { taskId, type: 'import', buffer, fileName: file.name, fileSize: file.size },
         [buffer],
       );
     }).catch(reject);

@@ -12,6 +12,7 @@ interface ImportMessage {
   type: 'import';
   buffer: ArrayBuffer;
   fileName: string;
+  fileSize?: number;
 }
 
 interface OcctNode {
@@ -63,6 +64,21 @@ function getFileExtension(fileName: string): string {
   return fileName.split('.').pop()?.toLowerCase() || '';
 }
 
+// ─── Adaptive deflection based on file size ─────────────────────────────────
+
+function getDeflectionParams(fileSize: number) {
+  if (fileSize > 200 * 1024 * 1024) {
+    // >200MB — coarse tessellation
+    return { linearDeflection: 0.01, angularDeflection: 2.0 };
+  }
+  if (fileSize > 50 * 1024 * 1024) {
+    // >50MB — medium tessellation
+    return { linearDeflection: 0.005, angularDeflection: 1.0 };
+  }
+  // Default — fine tessellation
+  return { linearDeflection: 0.001, angularDeflection: 0.5 };
+}
+
 let nodeIdCounter = 0;
 
 interface ConvertedNode {
@@ -111,8 +127,10 @@ function convertMesh(mesh: OcctMesh, index: number): ConvertedMesh {
 }
 
 self.onmessage = async (e: MessageEvent<ImportMessage>) => {
-  const { taskId, buffer, fileName } = e.data;
+  const { taskId, buffer, fileName, fileSize } = e.data;
   nodeIdCounter = 0;
+
+  const actualFileSize = fileSize ?? buffer.byteLength;
 
   try {
     self.postMessage({ taskId, type: 'progress', stage: 'Loading OCCT engine...', percent: 10 });
@@ -122,14 +140,15 @@ self.onmessage = async (e: MessageEvent<ImportMessage>) => {
     const fileBuffer = new Uint8Array(buffer);
 
     const ext = getFileExtension(fileName);
+    const deflection = getDeflectionParams(actualFileSize);
     let result: OcctResult;
 
     if (ext === 'stp' || ext === 'step') {
       result = occt.ReadStepFile(fileBuffer, {
         linearUnit: 'millimeter',
         linearDeflectionType: 'bounding_box_ratio',
-        linearDeflection: 0.001,
-        angularDeflection: 0.5,
+        linearDeflection: deflection.linearDeflection,
+        angularDeflection: deflection.angularDeflection,
       });
     } else if (ext === 'igs' || ext === 'iges') {
       result = occt.ReadIgesFile(fileBuffer, null);
@@ -146,7 +165,24 @@ self.onmessage = async (e: MessageEvent<ImportMessage>) => {
     self.postMessage({ taskId, type: 'progress', stage: 'Building hierarchy...', percent: 70 });
 
     const root = convertNode(result.root);
-    const meshes = result.meshes.map((m, i) => convertMesh(m, i));
+
+    // Convert meshes with granular progress
+    const totalMeshes = result.meshes.length;
+    const meshes: ConvertedMesh[] = [];
+    for (let i = 0; i < totalMeshes; i++) {
+      meshes.push(convertMesh(result.meshes[i], i));
+
+      // Report progress every 50 meshes
+      if (i > 0 && i % 50 === 0) {
+        const meshPercent = 70 + Math.round((i / totalMeshes) * 25);
+        self.postMessage({
+          taskId,
+          type: 'progress',
+          stage: `Converting meshes... (${i}/${totalMeshes})`,
+          percent: meshPercent,
+        });
+      }
+    }
 
     self.postMessage({ taskId, type: 'progress', stage: 'Done', percent: 100 });
 

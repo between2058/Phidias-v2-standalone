@@ -3,7 +3,7 @@
 import { useState, useRef, useEffect } from 'react';
 import type { MutableRefObject } from 'react';
 import * as THREE from 'three';
-import { Upload, Box, ChevronDown, Globe } from 'lucide-react';
+import { Upload, Box, ChevronDown, Globe, FileText, Printer } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWorkspace } from '@/lib/workspace-context';
 
@@ -13,13 +13,9 @@ interface ExportDropdownProps {
     sceneRef?: MutableRefObject<THREE.Group | null>;
 }
 
-// ── Export helpers ─────────────────────────────────────────────────────────────
+// ── Material swap helpers ──────────────────────────────────────────────────────
 
-/** Export a Three.js scene to a GLB ArrayBuffer.
- *  Temporarily restores original materials so the export always
- *  contains the original textures, not segment-color overrides. */
-async function exportSceneToGlb(scene: THREE.Group): Promise<ArrayBuffer> {
-    // Swap segment-color materials → original materials
+function swapToOriginalMaterials(scene: THREE.Group) {
     const overrides: { mesh: THREE.Mesh; coloredMat: THREE.Material | THREE.Material[] }[] = [];
     scene.traverse((child) => {
         if (child instanceof THREE.Mesh && child.userData.__origMaterial) {
@@ -27,7 +23,20 @@ async function exportSceneToGlb(scene: THREE.Group): Promise<ArrayBuffer> {
             child.material = child.userData.__origMaterial;
         }
     });
+    return overrides;
+}
 
+function restoreMaterials(overrides: { mesh: THREE.Mesh; coloredMat: THREE.Material | THREE.Material[] }[]) {
+    for (const { mesh, coloredMat } of overrides) {
+        mesh.material = coloredMat;
+    }
+}
+
+// ── Export helpers ─────────────────────────────────────────────────────────────
+
+/** Export a Three.js scene to a GLB ArrayBuffer. */
+async function exportSceneToGlb(scene: THREE.Group): Promise<ArrayBuffer> {
+    const overrides = swapToOriginalMaterials(scene);
     const { GLTFExporter } = await import('three/examples/jsm/exporters/GLTFExporter.js');
     const exporter = new GLTFExporter();
     const result = await new Promise<ArrayBuffer>((resolve, reject) => {
@@ -38,12 +47,7 @@ async function exportSceneToGlb(scene: THREE.Group): Promise<ArrayBuffer> {
             { binary: true },
         );
     });
-
-    // Restore segment-color materials
-    for (const { mesh, coloredMat } of overrides) {
-        mesh.material = coloredMat;
-    }
-
+    restoreMaterials(overrides);
     return result;
 }
 
@@ -96,23 +100,11 @@ async function downloadUsdz(modelUrl: string, baseName: string) {
 
 /** Export the live Three.js scene and download as USDZ. */
 async function downloadUsdzFromScene(scene: THREE.Group, baseName: string) {
-    // Swap segment-color materials → original materials
-    const overrides: { mesh: THREE.Mesh; coloredMat: THREE.Material | THREE.Material[] }[] = [];
-    scene.traverse((child) => {
-        if (child instanceof THREE.Mesh && child.userData.__origMaterial) {
-            overrides.push({ mesh: child, coloredMat: child.material });
-            child.material = child.userData.__origMaterial;
-        }
-    });
-
+    const overrides = swapToOriginalMaterials(scene);
     const { USDZExporter } = await import('three/examples/jsm/exporters/USDZExporter.js');
     const exporter = new USDZExporter();
     const arraybuffer = await exporter.parseAsync(scene);
-
-    // Restore segment-color materials
-    for (const { mesh, coloredMat } of overrides) {
-        mesh.material = coloredMat;
-    }
+    restoreMaterials(overrides);
 
     const blob = new Blob([arraybuffer], { type: 'model/vnd.usdz+zip' });
     const url = URL.createObjectURL(blob);
@@ -125,7 +117,47 @@ async function downloadUsdzFromScene(scene: THREE.Group, baseName: string) {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
+/** Export the live Three.js scene as OBJ. */
+async function downloadObjFromScene(scene: THREE.Group, baseName: string) {
+    const overrides = swapToOriginalMaterials(scene);
+    const { OBJExporter } = await import('three/examples/jsm/exporters/OBJExporter.js');
+    const exporter = new OBJExporter();
+    const result = exporter.parse(scene);
+    restoreMaterials(overrides);
+
+    const blob = new Blob([result], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}.obj`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+/** Export the live Three.js scene as STL. */
+async function downloadStlFromScene(scene: THREE.Group, baseName: string) {
+    const overrides = swapToOriginalMaterials(scene);
+    const { STLExporter } = await import('three/examples/jsm/exporters/STLExporter.js');
+    const exporter = new STLExporter();
+    const result = exporter.parse(scene, { binary: true });
+    restoreMaterials(overrides);
+
+    const blob = new Blob([result], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${baseName}.stl`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
+
+type ExportFormat = 'glb' | 'usdz' | 'obj' | 'stl';
 
 export default function ExportDropdown({ className, sceneRef }: ExportDropdownProps) {
     const [open, setOpen] = useState(false);
@@ -148,7 +180,7 @@ export default function ExportDropdown({ className, sceneRef }: ExportDropdownPr
 
     const baseName = activeAsset?.name.replace(/\.[^/.]+$/, '') ?? 'model';
 
-    async function handleExport(format: 'glb' | 'usdz') {
+    async function handleExport(format: ExportFormat) {
         if (!activeAsset?.modelUrl || working) return;
         setWorking(true);
         setOpen(false);
@@ -160,11 +192,23 @@ export default function ExportDropdown({ className, sceneRef }: ExportDropdownPr
                 } else {
                     downloadGlb(activeAsset.modelUrl, baseName);
                 }
-            } else {
+            } else if (format === 'usdz') {
                 if (liveScene) {
                     await downloadUsdzFromScene(liveScene, baseName);
                 } else {
                     await downloadUsdz(activeAsset.modelUrl, baseName);
+                }
+            } else if (format === 'obj') {
+                if (liveScene) {
+                    await downloadObjFromScene(liveScene, baseName);
+                } else {
+                    console.warn('[ExportDropdown] OBJ export requires a live scene');
+                }
+            } else if (format === 'stl') {
+                if (liveScene) {
+                    await downloadStlFromScene(liveScene, baseName);
+                } else {
+                    console.warn('[ExportDropdown] STL export requires a live scene');
                 }
             }
         } catch (err) {
@@ -173,6 +217,8 @@ export default function ExportDropdown({ className, sceneRef }: ExportDropdownPr
             setWorking(false);
         }
     }
+
+    const hasLiveScene = !!sceneRef?.current;
 
     return (
         <div ref={containerRef} className={cn('relative', className)}>
@@ -190,7 +236,7 @@ export default function ExportDropdown({ className, sceneRef }: ExportDropdownPr
                     title={disabled ? 'No active asset' : `Export "${activeAsset?.name}" as .glb`}
                 >
                     <Upload size={12} />
-                    <span>{working ? 'Exporting…' : 'Export'}</span>
+                    <span>{working ? 'Exporting...' : 'Export'}</span>
                 </button>
 
                 {/* Dropdown chevron */}
@@ -237,6 +283,40 @@ export default function ExportDropdown({ className, sceneRef }: ExportDropdownPr
                             <div className="text-xs font-medium text-text-primary mb-0.5">.usdz</div>
                             <div className="text-[11px] text-text-tertiary leading-tight">
                                 Universal Scene Description (iOS AR)
+                            </div>
+                        </div>
+                    </button>
+
+                    <button
+                        className={cn(
+                            'w-full flex items-start gap-3 px-4 py-3 hover:bg-bg-hover transition-colors text-left',
+                            !hasLiveScene && 'opacity-40 cursor-not-allowed',
+                        )}
+                        onClick={() => handleExport('obj')}
+                        disabled={!hasLiveScene}
+                    >
+                        <span className="mt-0.5 shrink-0 text-text-secondary"><FileText size={14} /></span>
+                        <div className="min-w-0">
+                            <div className="text-xs font-medium text-text-primary mb-0.5">.obj</div>
+                            <div className="text-[11px] text-text-tertiary leading-tight">
+                                Wavefront OBJ (KeyShot-compatible)
+                            </div>
+                        </div>
+                    </button>
+
+                    <button
+                        className={cn(
+                            'w-full flex items-start gap-3 px-4 py-3 hover:bg-bg-hover transition-colors text-left',
+                            !hasLiveScene && 'opacity-40 cursor-not-allowed',
+                        )}
+                        onClick={() => handleExport('stl')}
+                        disabled={!hasLiveScene}
+                    >
+                        <span className="mt-0.5 shrink-0 text-text-secondary"><Printer size={14} /></span>
+                        <div className="min-w-0">
+                            <div className="text-xs font-medium text-text-primary mb-0.5">.stl</div>
+                            <div className="text-[11px] text-text-tertiary leading-tight">
+                                Stereolithography (3D printing)
                             </div>
                         </div>
                     </button>

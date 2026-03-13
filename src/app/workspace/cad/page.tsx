@@ -4,6 +4,9 @@ import React, { useRef, useState, useCallback, useEffect, useMemo, Suspense } fr
 import dynamic from 'next/dynamic';
 import type * as THREE from 'three';
 import CADHierarchyTree from '@/components/cad/CADHierarchyTree';
+import CADDiffPanel, { diffToSegmentColors } from '@/components/cad/CADDiffPanel';
+import AutoCleanDialog from '@/components/cad/AutoCleanDialog';
+import type { AutoCleanOptions } from '@/components/cad/AutoCleanDialog';
 import ExportDropdown from '@/components/shared/ExportDropdown';
 import type { TransformData } from '@/lib/api/types';
 import type { RenderMode } from '@/components/shared/ThreeViewport';
@@ -16,12 +19,18 @@ import {
     cadResultToGlbUrl,
     detectDuplicates,
     expandHierarchy,
+    disposeCADMeshBuffers,
 } from '@/lib/occt-bridge';
 import type {
     CADImportProgress,
     CADImportResult,
     DuplicateGroup,
 } from '@/lib/occt-bridge';
+import { diffCADResults } from '@/lib/cad-diff';
+import type { DiffResult } from '@/lib/cad-diff';
+import { useCADStore } from '@/store/cad-store';
+import { moveNode, groupNodes, ungroupNode, deleteNodes } from '@/lib/cad-tree-ops';
+import { Sparkles, Undo2, Redo2, GitCompareArrows } from 'lucide-react';
 
 const ThreeViewport = dynamic(() => import('@/components/shared/ThreeViewport'), {
     ssr: false,
@@ -83,16 +92,22 @@ export default function CADPage() {
     const activeAsset = assets.find(a => a.id === activeAssetId) ?? null;
     const modelUrl = activeAsset?.modelUrl ?? null;
 
+    // ── CAD store (Zustand + Zundo for undo/redo) ─────────────────────────────
+    const { hierarchyItems: _hierarchyItems, setHierarchyItems } = useCADStore();
+    const { undo, redo, pastStates, futureStates } = useCADStore.temporal.getState();
+    const canUndo = pastStates.length > 0;
+    const canRedo = futureStates.length > 0;
+
     // ── Local page state ───────────────────────────────────────────────────────
     const sceneRef = useRef<THREE.Group | null>(null);
     const [isLoading, setIsLoading] = useState(false);
-    const [renderMode, setRenderMode] = useState<RenderMode>('solid');
-    const [transformMode, setTransformMode] = useState<'translate' | 'rotate' | 'scale' | null>(null);
+    const [renderMode, _setRenderMode] = useState<RenderMode>('solid');
+    const [transformMode, _setTransformMode] = useState<'translate' | 'rotate' | 'scale' | null>(null);
     const [selectedObjectId, setSelectedObjectId] = useState<string | null>(null);
     const [selectedObjectIds, setSelectedObjectIds] = useState<string[]>([]);
     const [selectedTransform, setSelectedTransform] = useState<TransformValues | null>(null);
     const [sceneGraph, setLocalSceneGraph] = useState<HierarchyItem[]>([]);
-    const [showGrid, setShowGrid] = useState(true);
+    const [showGrid, _setShowGrid] = useState(true);
     const [colorViewMode, setColorViewMode] = useState<'original' | 'colored'>('original');
 
     // ── CAD-specific state ─────────────────────────────────────────────────────
@@ -100,19 +115,46 @@ export default function CADPage() {
     const [cadResult, setCadResult] = useState<CADImportResult | null>(null);
     const [duplicates, setDuplicates] = useState<DuplicateGroup[]>([]);
     const [cadSelectedNodeId, setCadSelectedNodeId] = useState<string | null>(null);
+    const [cadSelectedNodeIds, setCadSelectedNodeIds] = useState<string[]>([]);
     const [highlightedMeshIndices, setHighlightedMeshIndices] = useState<Set<number>>(new Set());
 
-    // Auto-derive segment colors from scene graph meshes
+    // ── Diff state ─────────────────────────────────────────────────────────────
+    const [diffMode, setDiffMode] = useState(false);
+    const [diffResult, setDiffResult] = useState<DiffResult | null>(null);
+
+    // ── Auto clean state ───────────────────────────────────────────────────────
+    const [showAutoClean, setShowAutoClean] = useState(false);
+
+    // Auto-derive segment colors from scene graph meshes (or diff colors)
     const segmentColors = useMemo(() => {
+        if (diffMode && diffResult) {
+            return diffToSegmentColors(diffResult);
+        }
         if (colorViewMode === 'original') return undefined;
         const meshes = flattenMeshes(sceneGraph);
         if (meshes.length <= 1) return undefined;
         const colors: Record<string, string> = {};
         meshes.forEach((m, i) => { colors[m.id] = SEGMENT_PALETTE[i % SEGMENT_PALETTE.length]; });
         return colors;
-    }, [colorViewMode, sceneGraph]);
+    }, [colorViewMode, sceneGraph, diffMode, diffResult]);
 
     const hasMultipleParts = useMemo(() => flattenMeshes(sceneGraph).length > 1, [sceneGraph]);
+
+    // ── Undo/Redo keyboard shortcuts ──────────────────────────────────────────
+    useEffect(() => {
+        function handleKeyDown(e: KeyboardEvent) {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'z') {
+                e.preventDefault();
+                if (e.shiftKey) {
+                    redo();
+                } else {
+                    undo();
+                }
+            }
+        }
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [undo, redo]);
 
     // ── Scene graph → workspace context (right panel) ──────────────────────────
     const handleObjectSelectForContext = useCallback((id: string | null) => {
@@ -188,6 +230,8 @@ export default function CADPage() {
         setSelectedTransform(null);
         setLocalSceneGraph([]);
         setColorViewMode('original');
+        setDiffMode(false);
+        setDiffResult(null);
         sceneRef.current = null;
     }, [activeAssetId]);
 
@@ -196,9 +240,11 @@ export default function CADPage() {
         setIsLoading(true);
         setCadProgress({ stage: 'Reading file...', percent: 0 });
         setCadSelectedNodeId(null);
+        setCadSelectedNodeIds([]);
         setHighlightedMeshIndices(new Set());
 
         try {
+            const t0 = performance.now();
             const rawResult = await importStepFile(file, setCadProgress);
             const result = expandHierarchy(rawResult);
 
@@ -207,6 +253,12 @@ export default function CADPage() {
 
             setCadProgress({ stage: 'Converting to GLB...', percent: 90 });
             const glbUrl = await cadResultToGlbUrl(result);
+
+            // Dispose raw mesh buffers after GLB conversion to free memory
+            disposeCADMeshBuffers(result);
+
+            const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+            console.log(`[CAD Import] ${file.name}: ${elapsed}s`);
 
             const assetId = addAsset({
                 name: file.name.replace(/\.[^.]+$/, '') || 'CAD Import',
@@ -252,6 +304,13 @@ export default function CADPage() {
         }
     }, [handleObjectSelectForContext]);
 
+    const handleCadNodeMultiSelect = useCallback((nodeId: string) => {
+        setCadSelectedNodeIds(prev =>
+            prev.includes(nodeId) ? prev.filter(x => x !== nodeId) : [...prev, nodeId]
+        );
+        setCadSelectedNodeId(nodeId);
+    }, []);
+
     const handleCadNodeVisibilityToggle = useCallback((_nodeId: string, visible: boolean) => {
         if (sceneRef.current) {
             sceneRef.current.traverse((obj) => {
@@ -277,6 +336,91 @@ export default function CADPage() {
         setDuplicates(prev => prev.filter(g => g.hash !== group.hash));
     }, []);
 
+    // ── Manual grouping: DnD and context menu ─────────────────────────────────
+    const handleMoveNode = useCallback((nodeId: string, targetParentId: string | null, insertIndex?: number) => {
+        setHierarchyItems(prev => moveNode(prev, nodeId, targetParentId, insertIndex));
+    }, [setHierarchyItems]);
+
+    const handleContextAction = useCallback((action: 'new-group' | 'group-selected' | 'ungroup' | 'delete', nodeId: string) => {
+        switch (action) {
+            case 'new-group':
+                setHierarchyItems(prev => groupNodes(prev, [], `New Group`));
+                break;
+            case 'group-selected': {
+                const ids = cadSelectedNodeIds.length > 1 ? cadSelectedNodeIds : [nodeId];
+                setHierarchyItems(prev => groupNodes(prev, ids));
+                break;
+            }
+            case 'ungroup':
+                setHierarchyItems(prev => ungroupNode(prev, nodeId));
+                break;
+            case 'delete': {
+                const ids = cadSelectedNodeIds.length > 1 ? cadSelectedNodeIds : [nodeId];
+                setHierarchyItems(prev => deleteNodes(prev, ids));
+                break;
+            }
+        }
+    }, [setHierarchyItems, cadSelectedNodeIds]);
+
+    // ── Auto Clean Pipeline ───────────────────────────────────────────────────
+    const handleAutoClean = useCallback((options: AutoCleanOptions) => {
+        if (options.removeDuplicates && sceneRef.current) {
+            // Hide all duplicate meshes (keep one per group)
+            for (const group of duplicates) {
+                const indicesToHide = group.meshIndices.slice(1);
+                let meshIndex = 0;
+                sceneRef.current.traverse((obj) => {
+                    if ((obj as THREE.Mesh).isMesh) {
+                        if (indicesToHide.includes(meshIndex)) {
+                            obj.visible = false;
+                        }
+                        meshIndex++;
+                    }
+                });
+            }
+            setDuplicates([]);
+        }
+    }, [duplicates]);
+
+    // ── STP Diff ──────────────────────────────────────────────────────────────
+    const handleCompareWith = useCallback(async () => {
+        if (!cadResult) return;
+
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = '.stp,.step,.igs,.iges,.brep,.brp';
+        input.onchange = async () => {
+            const file = input.files?.[0];
+            if (!file) return;
+
+            try {
+                setCadProgress({ stage: 'Importing comparison file...', percent: 0 });
+                setIsLoading(true);
+                const rawResultB = await importStepFile(file, setCadProgress);
+                const resultB = expandHierarchy(rawResultB);
+
+                const diff = diffCADResults(
+                    cadResult.root,
+                    cadResult.meshes,
+                    resultB.root,
+                    resultB.meshes,
+                );
+
+                setDiffResult(diff);
+                setDiffMode(true);
+
+                // Dispose the comparison file's buffers
+                disposeCADMeshBuffers(resultB);
+            } catch (err) {
+                console.error('Diff import failed:', err);
+            } finally {
+                setIsLoading(false);
+                setCadProgress(null);
+            }
+        };
+        input.click();
+    }, [cadResult]);
+
     // ── Viewport callbacks ─────────────────────────────────────────────────────
     const handleSceneReady = useCallback((group: THREE.Group) => { sceneRef.current = group; }, []);
     const handleSceneGraphChange = useCallback((nodes: HierarchyItem[]) => setLocalSceneGraph(nodes), []);
@@ -301,11 +445,14 @@ export default function CADPage() {
         [activeAssetId, updateAsset]
     );
 
+    // ── Computed values ────────────────────────────────────────────────────────
+    const totalDuplicates = duplicates.reduce((sum, g) => sum + g.count - 1, 0);
+
     // ─────────────────────────────────────────────────────────────────────────
     return (
         <div className="flex h-full overflow-hidden" style={{ background: '#1a1a2e' }}>
-            {/* Left panel — CAD Hierarchy + Duplicates */}
-            {cadResult && (
+            {/* Left panel — CAD Hierarchy + Duplicates OR Diff panel */}
+            {(cadResult || diffMode) && (
                 <aside
                     className="w-[260px] flex-shrink-0 overflow-hidden flex flex-col border-r"
                     style={{ background: '#1e1e36', borderColor: '#333355' }}
@@ -329,15 +476,26 @@ export default function CADPage() {
                         </div>
                     )}
 
-                    <CADHierarchyTree
-                        root={cadResult.root}
-                        duplicates={duplicates}
-                        selectedNodeId={cadSelectedNodeId}
-                        highlightedMeshIndices={highlightedMeshIndices}
-                        onNodeSelect={handleCadNodeSelect}
-                        onNodeVisibilityToggle={handleCadNodeVisibilityToggle}
-                        onDeleteDuplicates={handleDeleteDuplicates}
-                    />
+                    {diffMode && diffResult ? (
+                        <CADDiffPanel
+                            diff={diffResult}
+                            onClose={() => { setDiffMode(false); setDiffResult(null); }}
+                        />
+                    ) : cadResult ? (
+                        <CADHierarchyTree
+                            root={cadResult.root}
+                            duplicates={duplicates}
+                            selectedNodeId={cadSelectedNodeId}
+                            selectedNodeIds={cadSelectedNodeIds}
+                            highlightedMeshIndices={highlightedMeshIndices}
+                            onNodeSelect={handleCadNodeSelect}
+                            onNodeMultiSelect={handleCadNodeMultiSelect}
+                            onNodeVisibilityToggle={handleCadNodeVisibilityToggle}
+                            onDeleteDuplicates={handleDeleteDuplicates}
+                            onMoveNode={handleMoveNode}
+                            onContextAction={handleContextAction}
+                        />
+                    ) : null}
                 </aside>
             )}
 
@@ -383,9 +541,63 @@ export default function CADPage() {
                     className="absolute bottom-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-4 py-2.5 rounded-full z-10"
                     style={{ background: 'rgba(13,13,24,0.95)', border: '1px solid #333355' }}
                 >
+                    {/* Undo/Redo */}
+                    <button
+                        onClick={() => undo()}
+                        disabled={!canUndo}
+                        className="p-1.5 rounded-lg text-[#94a3b8] hover:bg-[#ffffff08] disabled:opacity-30 disabled:cursor-not-allowed"
+                        title="Undo (Ctrl+Z)"
+                    >
+                        <Undo2 size={14} />
+                    </button>
+                    <button
+                        onClick={() => redo()}
+                        disabled={!canRedo}
+                        className="p-1.5 rounded-lg text-[#94a3b8] hover:bg-[#ffffff08] disabled:opacity-30 disabled:cursor-not-allowed"
+                        title="Redo (Ctrl+Shift+Z)"
+                    >
+                        <Redo2 size={14} />
+                    </button>
+
+                    <div className="w-px h-5 bg-[#333355]" />
+
+                    {/* Auto Clean */}
+                    {cadResult && (
+                        <button
+                            onClick={() => setShowAutoClean(true)}
+                            className="p-1.5 rounded-lg text-[#D5B451] hover:bg-[#D5B451]/10"
+                            title="Auto Clean"
+                        >
+                            <Sparkles size={14} />
+                        </button>
+                    )}
+
+                    {/* Compare / Diff */}
+                    {cadResult && !diffMode && (
+                        <button
+                            onClick={handleCompareWith}
+                            className="p-1.5 rounded-lg text-[#94a3b8] hover:bg-[#ffffff08]"
+                            title="Compare with..."
+                        >
+                            <GitCompareArrows size={14} />
+                        </button>
+                    )}
+
+                    <div className="w-px h-5 bg-[#333355]" />
+
                     <ExportDropdown sceneRef={sceneRef} />
                 </div>
             </main>
+
+            {/* Auto Clean Dialog */}
+            {showAutoClean && (
+                <AutoCleanDialog
+                    duplicateCount={totalDuplicates}
+                    duplicateGroupCount={duplicates.length}
+                    onRun={handleAutoClean}
+                    onClose={() => setShowAutoClean(false)}
+                />
+            )}
         </div>
     );
 }
