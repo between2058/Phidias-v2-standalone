@@ -24,6 +24,7 @@ const tabs: SidebarTab[] = [
     { icon: <Camera size={20} />, label: 'Image', href: '/workspace/image' },
     { icon: <Sparkles size={20} />, label: 'Model', href: '/workspace/model' },
     { icon: <Scissors size={20} />, label: 'Segment', href: '/workspace/segment' },
+    { icon: <Hexagon size={20} />, label: 'CAD', href: '/workspace/cad' },
     //   { icon: <Hexagon size={20} />, label: 'Retopo', href: '/workspace/retopo' },
     //   { icon: <Paintbrush size={20} />, label: 'Texture', href: '/workspace/texture' },
     //   { icon: <Atom size={20} />, label: 'Physics', href: '/workspace/physics' },

@@ -8,7 +8,7 @@ const nextConfig = {
   // PlayCanvas and its React wrapper are ESM-only packages
   transpilePackages: ['@playcanvas/react', 'playcanvas'],
 
-  webpack: (config) => {
+  webpack: (config, { isServer }) => {
     // Stub physics engine — we don't use PlayCanvas physics
     config.resolve.alias['sync-ammo'] = path.resolve(__dirname, 'src/lib/stubs/sync-ammo.js');
 
@@ -30,6 +30,20 @@ const nextConfig = {
       test: sparkCjsPath,
       type: 'javascript/auto',
     });
+
+    // WASM support for occt-import-js
+    config.experiments = {
+      ...config.experiments,
+      asyncWebAssembly: true,
+    };
+
+    // Exclude occt-import-js from server-side bundling (browser-only WASM)
+    if (isServer) {
+      config.externals = config.externals || [];
+      if (Array.isArray(config.externals)) {
+        config.externals.push('occt-import-js');
+      }
+    }
 
     return config;
   },
