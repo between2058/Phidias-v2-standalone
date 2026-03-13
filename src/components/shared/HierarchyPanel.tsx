@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { Boxes, Eye, EyeOff, MoreHorizontal, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -15,12 +15,14 @@ export interface HierarchyItem {
 interface HierarchyPanelProps {
     items: HierarchyItem[];
     selectedId?: string;
-    selectedIds?: string[]; // Added for multi-selection
+    selectedIds?: string[];
     onSelect?: (id: string) => void;
     /** Called on Ctrl/Cmd+click — parent handles toggle logic */
     onMultiSelect?: (id: string) => void;
     onVisibilityToggle?: (id: string, visible: boolean) => void;
     onMenuOpen?: (id: string) => void;
+    /** Called when user double-clicks to rename a node */
+    onRename?: (id: string, newName: string) => void;
     className?: string;
 }
 
@@ -28,27 +30,46 @@ interface HierarchyRowProps {
     item: HierarchyItem;
     depth: number;
     selectedId?: string;
-    selectedIds?: string[]; // Added for multi-selection
+    selectedIds?: string[];
     onSelect?: (id: string) => void;
     onMultiSelect?: (id: string) => void;
     onVisibilityToggle?: (id: string, visible: boolean) => void;
     onMenuOpen?: (id: string) => void;
+    onRename?: (id: string, newName: string) => void;
 }
 
 function HierarchyRow({
     item,
     depth,
     selectedId,
-    selectedIds, // Added
+    selectedIds,
     onSelect,
-    onMultiSelect, // Added
+    onMultiSelect,
     onVisibilityToggle,
     onMenuOpen,
+    onRename,
 }: HierarchyRowProps) {
     const [expanded, setExpanded] = useState(true);
-    // Determine if the item is selected, prioritizing multi-selection if available
+    const [isRenaming, setIsRenaming] = useState(false);
+    const [renameValue, setRenameValue] = useState(item.name);
+    const renameInputRef = useRef<HTMLInputElement>(null);
     const isSelected = selectedIds ? selectedIds.includes(item.id) : selectedId === item.id;
     const hasChildren = item.children && item.children.length > 0;
+
+    useEffect(() => {
+        if (isRenaming) {
+            setRenameValue(item.name);
+            setTimeout(() => renameInputRef.current?.select(), 0);
+        }
+    }, [isRenaming, item.name]);
+
+    const handleRenameSubmit = () => {
+        const trimmed = renameValue.trim();
+        if (trimmed && trimmed !== item.name && onRename) {
+            onRename(item.id, trimmed);
+        }
+        setIsRenaming(false);
+    };
 
     return (
         <>
@@ -61,11 +82,16 @@ function HierarchyRow({
                 )}
                 style={{ paddingLeft: 8 + depth * 16 }}
                 onClick={(e) => {
+                    if (isRenaming) return;
                     if ((e.ctrlKey || e.metaKey) && onMultiSelect) {
                         onMultiSelect(item.id);
                     } else {
                         onSelect?.(item.id);
                     }
+                }}
+                onDoubleClick={(e) => {
+                    e.stopPropagation();
+                    if (onRename) setIsRenaming(true);
                 }}
             >
                 {/* Expand/Collapse */}
@@ -92,34 +118,51 @@ function HierarchyRow({
                     )}
                 />
 
-                {/* Name */}
-                <span className="flex-1 text-xs truncate min-w-0">{item.name}</span>
+                {/* Name / Rename Input */}
+                {isRenaming ? (
+                    <input
+                        ref={renameInputRef}
+                        value={renameValue}
+                        onChange={e => setRenameValue(e.target.value)}
+                        onBlur={handleRenameSubmit}
+                        onKeyDown={e => {
+                            if (e.key === 'Enter') e.currentTarget.blur();
+                            if (e.key === 'Escape') setIsRenaming(false);
+                        }}
+                        onClick={e => e.stopPropagation()}
+                        className="flex-1 text-xs text-white bg-transparent border-b border-[#D5B451] outline-none min-w-0"
+                    />
+                ) : (
+                    <span className="flex-1 text-xs truncate min-w-0">{item.name}</span>
+                )}
 
                 {/* Actions */}
-                <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button
-                        className="p-0.5 rounded hover:bg-white/10 transition-colors"
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            onVisibilityToggle?.(item.id, !item.visible);
-                        }}
-                    >
-                        {item.visible ? (
-                            <Eye size={12} className="text-text-tertiary" />
-                        ) : (
-                            <EyeOff size={12} className="text-text-muted" />
-                        )}
-                    </button>
-                    <button
-                        className="p-0.5 rounded hover:bg-white/10 transition-colors"
-                        onClick={(e) => {
-                            e.stopPropagation();
-                            onMenuOpen?.(item.id);
-                        }}
-                    >
-                        <MoreHorizontal size={12} className="text-text-tertiary" />
-                    </button>
-                </div>
+                {!isRenaming && (
+                    <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <button
+                            className="p-0.5 rounded hover:bg-white/10 transition-colors"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                onVisibilityToggle?.(item.id, !item.visible);
+                            }}
+                        >
+                            {item.visible ? (
+                                <Eye size={12} className="text-text-tertiary" />
+                            ) : (
+                                <EyeOff size={12} className="text-text-muted" />
+                            )}
+                        </button>
+                        <button
+                            className="p-0.5 rounded hover:bg-white/10 transition-colors"
+                            onClick={(e) => {
+                                e.stopPropagation();
+                                onMenuOpen?.(item.id);
+                            }}
+                        >
+                            <MoreHorizontal size={12} className="text-text-tertiary" />
+                        </button>
+                    </div>
+                )}
             </div>
 
             {/* Children */}
@@ -131,11 +174,12 @@ function HierarchyRow({
                             item={child}
                             depth={depth + 1}
                             selectedId={selectedId}
-                            selectedIds={selectedIds} // Pass down
+                            selectedIds={selectedIds}
                             onSelect={onSelect}
-                            onMultiSelect={onMultiSelect} // Pass down
+                            onMultiSelect={onMultiSelect}
                             onVisibilityToggle={onVisibilityToggle}
                             onMenuOpen={onMenuOpen}
+                            onRename={onRename}
                         />
                     ))}
                 </div>
@@ -147,11 +191,12 @@ function HierarchyRow({
 export default function HierarchyPanel({
     items,
     selectedId,
-    selectedIds, // Added
+    selectedIds,
     onSelect,
-    onMultiSelect, // Added
+    onMultiSelect,
     onVisibilityToggle,
     onMenuOpen,
+    onRename,
     className,
 }: HierarchyPanelProps) {
     return (
@@ -169,11 +214,12 @@ export default function HierarchyPanel({
                             item={item}
                             depth={0}
                             selectedId={selectedId}
-                            selectedIds={selectedIds} // Pass down
+                            selectedIds={selectedIds}
                             onSelect={onSelect}
-                            onMultiSelect={onMultiSelect} // Pass down
+                            onMultiSelect={onMultiSelect}
                             onVisibilityToggle={onVisibilityToggle}
                             onMenuOpen={onMenuOpen}
+                            onRename={onRename}
                         />
                     ))
                 )}

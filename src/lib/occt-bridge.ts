@@ -192,6 +192,28 @@ export function cadResultToThreeGroup(result: CADImportResult): THREE.Group {
   return root;
 }
 
+// ─── GLB Export (for ThreeViewport compatibility) ────────────────────────────
+
+/**
+ * Convert a CADImportResult into a GLB blob URL that ThreeViewport can load.
+ * This lets us reuse the shared viewport with all its features.
+ */
+export async function cadResultToGlbUrl(result: CADImportResult): Promise<string> {
+  const group = cadResultToThreeGroup(result);
+  const { GLTFExporter } = await import('three/examples/jsm/exporters/GLTFExporter.js');
+  const exporter = new GLTFExporter();
+  const glb = await new Promise<ArrayBuffer>((resolve, reject) => {
+    exporter.parse(
+      group,
+      (r) => resolve(r as ArrayBuffer),
+      (err) => reject(err),
+      { binary: true },
+    );
+  });
+  const blob = new Blob([glb], { type: 'model/gltf-binary' });
+  return URL.createObjectURL(blob);
+}
+
 // ─── Worker-based Import ─────────────────────────────────────────────────────
 
 let workerInstance: Worker | null = null;

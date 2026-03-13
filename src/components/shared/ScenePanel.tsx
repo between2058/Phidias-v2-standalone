@@ -46,6 +46,7 @@ export default function ScenePanel() {
                     onSelect={sceneGraph?.onSelect}
                     onMultiSelect={sceneGraph?.onMultiSelect}
                     onVisibilityToggle={sceneGraph?.onVisibilityToggle}
+                    onRename={sceneGraph?.onRename}
                 />
             </div>
 

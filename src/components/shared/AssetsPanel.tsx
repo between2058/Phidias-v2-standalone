@@ -669,7 +669,7 @@ function UploadCard({ onClick, viewMode }: { onClick: () => void; viewMode: View
                 </div>
                 <div className="flex-1 min-w-0 text-left">
                     <p className="text-xs text-[#4b5563] font-medium">Upload Model</p>
-                    <p className="text-[9px]" style={{ color: '#3d3d5c' }}>GLB, OBJ, FBX, STL</p>
+                    <p className="text-[9px]" style={{ color: '#3d3d5c' }}>GLB, OBJ, FBX, STL, STP</p>
                 </div>
             </button>
         );
@@ -690,8 +690,8 @@ function UploadCard({ onClick, viewMode }: { onClick: () => void; viewMode: View
                 Upload 3D Model
             </span>
             <span className="text-[#3d3d5c] text-[9px] text-center leading-tight px-2">
-                GLB, OBJ, FBX, STL
-                <br />≤100MB
+                GLB, STP, STEP, OBJ
+                <br />FBX, STL ≤100MB
             </span>
         </button>
     );
@@ -883,19 +883,27 @@ export default function AssetsPanel({ defaultTab = 'assets' }: { defaultTab?: Pa
         exitManageMode();
     };
 
+    const CAD_EXTENSIONS = ['.stp', '.step', '.iges', '.igs', '.brep', '.brp'];
+
     const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
         const file = e.target.files?.[0];
         if (!file) return;
-        const url = URL.createObjectURL(file);
-        const id = addAsset({
-            name: file.name.replace(/\.[^.]+$/, ''),
-            modelUrl: url,
-            type: 'untextured',
-            status: 'ready',
-            fileSize: file.size,
-            pipelineUsed: 'uploaded',
-        });
-        setActiveAssetId(id);
+        const ext = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
+        if (CAD_EXTENSIONS.includes(ext)) {
+            // Dispatch to CAD page for OCCT processing
+            window.dispatchEvent(new CustomEvent('phidias:cad-file-upload', { detail: file }));
+        } else {
+            const url = URL.createObjectURL(file);
+            const id = addAsset({
+                name: file.name.replace(/\.[^.]+$/, ''),
+                modelUrl: url,
+                type: 'untextured',
+                status: 'ready',
+                fileSize: file.size,
+                pipelineUsed: 'uploaded',
+            });
+            setActiveAssetId(id);
+        }
         e.target.value = '';
     };
 
@@ -917,8 +925,13 @@ export default function AssetsPanel({ defaultTab = 'assets' }: { defaultTab?: Pa
         setIsDragOver(false);
         const file = e.dataTransfer.files[0];
         if (!file) return;
-        const allowed = ['.glb', '.gltf', '.obj', '.fbx', '.stl', '.ply', '.usdz'];
         const ext = file.name.substring(file.name.lastIndexOf('.')).toLowerCase();
+        const cadExts = ['.stp', '.step', '.iges', '.igs', '.brep', '.brp'];
+        if (cadExts.includes(ext)) {
+            window.dispatchEvent(new CustomEvent('phidias:cad-file-upload', { detail: file }));
+            return;
+        }
+        const allowed = ['.glb', '.gltf', '.obj', '.fbx', '.stl', '.ply', '.usdz'];
         if (!allowed.includes(ext)) return;
         const url = URL.createObjectURL(file);
         const id = addAsset({
@@ -996,7 +1009,7 @@ export default function AssetsPanel({ defaultTab = 'assets' }: { defaultTab?: Pa
                     style={{ background: 'rgba(124,58,237,0.08)', border: '2px dashed #7c3aed', borderRadius: 0 }}>
                     <Upload size={24} style={{ color: '#7c3aed' }} className="mb-2" />
                     <p className="text-sm font-semibold" style={{ color: '#a78bfa' }}>Drop to upload</p>
-                    <p className="text-[11px] mt-1" style={{ color: '#7c3aed' }}>GLB, OBJ, FBX, PLY, STL, USDZ</p>
+                    <p className="text-[11px] mt-1" style={{ color: '#7c3aed' }}>GLB, STP, STEP, OBJ, FBX, PLY, STL</p>
                 </div>
             )}
 
@@ -1346,7 +1359,7 @@ export default function AssetsPanel({ defaultTab = 'assets' }: { defaultTab?: Pa
             <input
                 ref={fileInputRef}
                 type="file"
-                accept=".glb,.gltf"
+                accept=".glb,.gltf,.stp,.step,.iges,.igs,.brep,.brp"
                 className="hidden"
                 onChange={handleFileChange}
             />
